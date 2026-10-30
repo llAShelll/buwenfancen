@@ -1,0 +1,71 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>BuWenFanChen</AssemblyName>
+    <RootNamespace>BuWenFanChen</RootNamespace>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <AssemblyVersion>0.1.0.0</AssemblyVersion>
+    <FileVersion>0.1.0.0</FileVersion>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <GameDir>H:\SteamLibrary\steamapps\common\A1</GameDir>
+    <BepInExDir>$(GameDir)\BepInEx</BepInExDir>
+    <BgeSource>E:\不问凡尘MOD\RAG\model\bge-small-zh-v1.5</BgeSource>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="BepInEx.Core"><HintPath>$(BepInExDir)\core\BepInEx.Core.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="BepInEx.Unity.IL2CPP"><HintPath>$(BepInExDir)\core\BepInEx.Unity.IL2CPP.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="0Harmony"><HintPath>$(BepInExDir)\core\0Harmony.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Il2CppInterop.Runtime"><HintPath>$(BepInExDir)\core\Il2CppInterop.Runtime.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Game"><HintPath>$(BepInExDir)\interop\Game.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="A1Ainpc.Runtime"><HintPath>$(BepInExDir)\interop\A1Ainpc.Runtime.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.CoreModule"><HintPath>$(BepInExDir)\interop\UnityEngine.CoreModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Il2Cppmscorlib"><HintPath>$(BepInExDir)\interop\Il2Cppmscorlib.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Newtonsoft.Json"><HintPath>$(BepInExDir)\interop\Newtonsoft.Json.dll</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.29.0" />
+  </ItemGroup>
+
+  <!-- ★ 2026-10-29：内置「npcId → 真名」静态表（1591 条，29 KB）。
+       来源：语音 MOD 的 references\npcs\npc_id_name.csv（游戏官方 NPC 名单）。
+       嵌进 DLL 是为了热补丁：玩家只换 DLL 也能用，不用额外拷 config 文件。 -->
+  <ItemGroup>
+    <EmbeddedResource Include="Assets\npc-id-name.csv" />
+  </ItemGroup>
+
+  <Target Name="DeployToPlugins" AfterTargets="Build" Condition="'$(DeployToPlugins)' != 'false'">
+    <PropertyGroup>
+      <PluginDir>$(GameDir)\BepInEx\plugins\BuWenFanChen</PluginDir>
+      <BgeDest>$(PluginDir)\model\bge</BgeDest>
+    </PropertyGroup>
+    <MakeDir Directories="$(PluginDir)" />
+    <MakeDir Directories="$(BgeDest)" />
+
+    <!-- 主 DLL + 托管依赖（Microsoft.ML.OnnxRuntime.dll 等） -->
+    <ItemGroup>
+      <ManagedDlls Include="$(TargetDir)*.dll" />
+    </ItemGroup>
+    <Copy SourceFiles="@(ManagedDlls)" DestinationFolder="$(PluginDir)" SkipUnchangedFiles="true" />
+
+    <!-- ONNX 原生 DLL（win-x64） -->
+    <ItemGroup>
+      <NativeDlls Include="$(TargetDir)runtimes\win-x64\native\*.dll" Condition="Exists('$(TargetDir)runtimes\win-x64\native')" />
+    </ItemGroup>
+    <Copy SourceFiles="@(NativeDlls)" DestinationFolder="$(PluginDir)" SkipUnchangedFiles="true" Condition="'@(NativeDlls)' != ''" />
+
+    <!-- BGE 模型 + 分词器 -->
+    <Copy SourceFiles="$(BgeSource)\onnx\model_int8.onnx" DestinationFolder="$(BgeDest)" SkipUnchangedFiles="true" Condition="Exists('$(BgeSource)\onnx\model_int8.onnx')" />
+    <Copy SourceFiles="$(BgeSource)\tokenizer.json" DestinationFolder="$(BgeDest)" SkipUnchangedFiles="true" Condition="Exists('$(BgeSource)\tokenizer.json')" />
+
+    <Message Importance="high" Text="✓ 已部署（含 ONNX 运行时 + BGE 模型）" />
+  </Target>
+
+</Project>

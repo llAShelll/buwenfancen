@@ -1,0 +1,15 @@
+# 构建产物
+bin/
+obj/
+*.dll
+*.pdb
+*.user
+
+# 游戏提示词 dump（含玩家对话明文，绝不入库）
+dump/
+*.log
+
+# 本地临时
+.vs/
+.idea/
+*.suo
