@@ -386,6 +386,45 @@ public static class CardStore
         catch { return false; }
     }
 
+    /// <summary>
+    /// 这张卡有没有「实际内容」。
+    /// ★ 2026-10-31：玩家反馈——卡文件存在但只是空壳（人设区/口吻区全空），
+    ///   TryAutoGenCard 看到「有卡」就永远不再生成 → 这张卡永远是空卡。
+    ///   判据：人设 / 口吻 / NSFW / 自定义设定 任一字段有非空文字。
+    /// </summary>
+    public static bool HasRealContent(JsonObject card)
+    {
+        if (card == null) return false;
+        foreach (var sec in new[] { "人设", "口吻", "NSFW", "自定义设定" })
+        {
+            if (card[sec] is not JsonObject o) continue;
+            foreach (var kv in o)
+            {
+                if (!string.IsNullOrWhiteSpace(NodeText(kv.Value))) return true;
+            }
+        }
+        return false;
+    }
+
+    private static string NodeText(JsonNode v)
+    {
+        if (v == null) return "";
+        if (v is JsonArray arr)
+        {
+            var sb = new StringBuilder();
+            foreach (var x in arr) sb.Append(NodeText(x));
+            return sb.ToString();
+        }
+        if (v is JsonObject o)
+        {
+            var sb = new StringBuilder();
+            foreach (var kv in o) sb.Append(NodeText(kv.Value));
+            return sb.ToString();
+        }
+        try { return v.GetValue<string>() ?? ""; }
+        catch { try { return v.ToString(); } catch { return ""; } }
+    }
+
     /// <summary>这张卡是否启用（读顶层「启用」字段；缺省视为启用，兼容老卡/迁移卡）。</summary>
     public static bool IsEnabled(JsonObject card)
     {

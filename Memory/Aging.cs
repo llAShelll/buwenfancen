@@ -93,6 +93,57 @@ public static class Aging
         }
     }
 
+    /// <summary>summary 句块容量上限（2026-11-03 主人定：1000 条）</summary>
+    public static int SummaryChunkCap = 1000;
+
+    /// <summary>摘要轮数老化：超过 N 轮没被召回就删（0=关闭）。2026-11-03 主人定：按轮数不按系统时间。</summary>
+    public static int SummaryIdleTurns = 500;
+
+    /// <summary>
+    /// ★ 2026-11-03：摘要句块老化（按**轮数**，不按系统时间——单机游戏可能几个月不玩）。
+    /// · 当前轮次 - LastSeenTurn > SummaryIdleTurns → 删
+    /// · LastSeenTurn == 0（迁移/旧数据）→ 不参与轮数老化，避免误删 1.1.2 的老摘要
+    /// · 超过 SummaryChunkCap → 按 LastSeenTurn 最旧删
+    /// </summary>
+    public static List<string> EvictSummaryChunks(NpcMemory mem, string npcCfgId)
+    {
+        var events = new List<string>();
+        var sums = mem.Chunks.Where(c => c.Kind == ChunkKind.Summary).ToList();
+        if (sums.Count == 0) return events;
+
+        var currentTurn = mem.Chunks.Count > 0 ? mem.Chunks.Max(c => c.Turn) : 0;
+        var toRemove = new List<Chunk>();
+
+        // ① 轮数老化（只认 LastSeenTurn > 0）
+        if (SummaryIdleTurns > 0)
+        {
+            foreach (var c in sums)
+            {
+                if (c.LastSeenTurn > 0 && currentTurn - c.LastSeenTurn > SummaryIdleTurns)
+                    toRemove.Add(c);
+            }
+        }
+
+        // ② 容量上限（含①已判定的，按最久未召回先删）
+        var remain = sums.Where(c => !toRemove.Contains(c))
+                         .OrderBy(c => c.LastSeenTurn)
+                         .ThenBy(c => c.Turn)
+                         .ToList();
+        if (remain.Count > SummaryChunkCap)
+            toRemove.AddRange(remain.Take(remain.Count - SummaryChunkCap));
+
+        foreach (var c in toRemove)
+        {
+            if (!mem.Chunks.Remove(c)) continue;
+            mem.Vectors.Remove(c.Id);
+            var brief = c.Text.Length > 40 ? c.Text[..40] : c.Text;
+            var msg = $"摘要淘汰（段 {c.Turn}，LastSeenTurn={c.LastSeenTurn}）「{brief}」";
+            events.Add(msg);
+            MemoryStore.LogForget(npcCfgId, "摘要老化", brief);
+        }
+        return events;
+    }
+
     /// <summary>dialog chunk 的时间衰减系数（检索时加权用，5.5）。</summary>
     public static float TimeDecay(Chunk c, long nowEpochSeconds)
     {

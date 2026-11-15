@@ -28,6 +28,9 @@ internal static class AddNpcChatMessagePatch
 {
     private static readonly object Gate = new();
 
+    /// <summary>上一次看到的 NPC（用来判断换对话 → 清选项框）</summary>
+    private static string _lastNpcIdForHud;
+
     /// <summary>本次 AddNpcChatMessage 调用是不是开场白（Prefix 设，Postfix 读）</summary>
     [ThreadStatic] private static bool _openingInThisCall;
     private static string _dir;
@@ -100,15 +103,15 @@ internal static class AddNpcChatMessagePatch
         }
         catch
         {
-            // 检测失败时保守地认为「有」——宁可多补写，也不要让装了 TTS 的玩家失去兜底
+            // 检测失败时保守地认为「有」——宁可多走一步同步，也不要让装了 TTS 的玩家读错正文
             _ttsPresent = true;
         }
         try
         {
             BepInEx.Logging.Logger.CreateLogSource("不问凡尘").LogInfo(
                 _ttsPresent.Value
-                    ? "[输出] 语音 MOD 检测：已加载 → a1ttsv2 补写/校验生效"
-                    : "[输出] 语音 MOD 检测：未安装 → 只同步 content，不补写 a1ttsv2");
+                    ? "[输出] 语音 MOD 检测：已加载 → 裁段时同步 content 并清理旧台本（V1.3 起不再补写/重建台本）"
+                    : "[输出] 语音 MOD 检测：未安装 → 只同步 content");
         }
         catch { }
         return _ttsPresent.Value;
@@ -230,8 +233,43 @@ internal static class AddNpcChatMessagePatch
     {
         try
         {
+            // ★ 2026-11-10 体检打点：确认这个 patch 到底有没有被游戏调用。
+            //   四选一选项（OptionsProbe.TakeAndStrip）和自动好感度（MainIntimacyProbe.ParseAndSubmit）
+            //   的唯一调用点都在本方法里 —— 游戏更新后这两项一起失效，第一嫌疑就是本 patch 没挂上。
+            try
+            {
+                BuWenFanChen.Diagnostics.HealthProbe.Link(
+                    "AddNpcChatMessage 进入",
+                    "turn=" + promptTurnId + " raw=" + (npcRawOutput == null ? "null" : Len(npcRawOutput) + "字"));
+            }
+            catch { }
+
+            // ★ 2026-11-04：弹窗前置调研——只读遍历一次 UI 树，找聊天输入框。
+            //   放在 lock 之外，避免遍历期间占着锁；失败只打警告。
+            UiProbe.RunOnce();
+
+            // ★ 2026-11-04 19:5x：换对话就把选项框清掉。
+            //   NPC 一变（切到另一个人）说明进的是另一段对话，旧选项不该留在屏幕上；
+            //   这一段聊完一句之后 OptionsProbe 会重新 Show，正好符合「新对话聊一句再弹」。
+            try
+            {
+                var cfgNow = Memory.MemoryEngine.GetNpcCfgId(__instance);
+                if (!string.IsNullOrEmpty(cfgNow) && cfgNow != _lastNpcIdForHud)
+                {
+                    _lastNpcIdForHud = cfgNow;
+                    OptionsHud.Clear();
+                }
+            }
+            catch { }
+
             lock (Gate)
             {
+                // ★ 2026-11-03：先把模型给的顶层 "opts"（四选一对话选项）摘掉。
+                //   必须在 DetectFormat / SyncRawContent / TTS 之前 ——
+                //   这样下游看到的回复和加选项之前一模一样，游戏和语音都察觉不到。
+                //   摘下来的 4 条只记日志 + 落盘（opts_log.jsonl），等验证稳定再做弹窗面板。
+                npcRawOutput = BuWenFanChen.Output.OptionsProbe.TakeAndStrip(npcRawOutput, promptTurnId);
+
                 DetectFormat(npcRawOutput);
                 var rawMessageText = messageText;
 
@@ -244,7 +282,7 @@ internal static class AddNpcChatMessagePatch
                 //   归还时必须带同一枚代次 —— 杜绝「凭空创建资格」「A/B 串资格」。
                 var cfgIdForRound = Memory.MemoryEngine.GetNpcCfgId(__instance);
                 var consumedFirstRound = GreetingFilter.ConsumeFirstRound(cfgIdForRound, out var firstRoundGen);
-                var isFirstRound = consumedFirstRound || PromptConfig.FallbackAlways;
+                // ★ 2026-11-07：FallbackAlways 已删，不再需要 isFirstRound
 
                 if (IsOpeningMessage(__instance, rawMessageText))
                 {
@@ -283,13 +321,9 @@ internal static class AddNpcChatMessagePatch
                 //   为什么不用「有没有模型回复」：老 NPC 有几十条历史，那条判据永远为 false，
                 //   但它的历史全是纯文本 → 模型第一轮照样被压着不吐 → 没人兜底 → 哑。
                 //   现在由 StartFreeChatAsync 置一个标记，输出侧取用一次。
-                var (replyCount, chatCount) = CountModelReplies(__instance);
-                if (!isFirstRound && chatCount > 0)
-                {
-                    // 只在异常情况打一次，避免刷屏；正常轮次由 SyncRawContent 里的日志覆盖
-                }
+                // ★ 2026-11-07：补写功能已删，SyncRawContent 只做「同步 content + 裁台词时清台本」
                 var synced = SyncRawContent(npcRawOutput, processed.Text, processed.CutApplied,
-                                    processed.DialogueCut, isFirstRound);
+                                    processed.DialogueCut);
                 if (!ReferenceEquals(synced, npcRawOutput))
                 {
                     npcRawOutput = synced;
@@ -301,8 +335,48 @@ internal static class AddNpcChatMessagePatch
                 var (jid, juser) = MemoryEngine.PeekPending();
                 MemoryEngine.FlushTurn(messageText, promptTurnId);
 
-                // ★ 2026-10-27：自动好感度判定（读配置：sync 当场加 / async 迟一轮）
-                try { BuWenFanChen.IntimacyJudge.Judge(jid, juser, messageText, __instance); } catch { }
+                // ★ 2026-11-13 懒生成：真的聊过之后，才生成角色卡 / 角色世界书（没聊天不生成）
+                try { CompleteBudgetedPatch.EnsureLazyGen(__instance); } catch { }
+
+                // ★ 2026-11-04：自动好感度——两条路，由 intimacyInMainRequest 开关决定
+                //   ① 主请求模式（新，默认）：模型在主回复 JSON 里顺带给 intimacy，我们只解析，
+                //      不再单独发一次判断请求（省一次调用，而且它有完整上下文，更准）
+                //   ② 独立请求模式（旧）：单独调 LLM 判断，迟一轮生效
+                try
+                {
+                    if (PromptConfig.IntimacyInMainRequest)
+                    {
+                        BuWenFanChen.Output.MainIntimacyProbe.ParseAndSubmit(
+                            jid, BuWenFanChen.Output.RawReplyStore.Peek());
+                    }
+                    else
+                    {
+                        BuWenFanChen.IntimacyJudge.Judge(jid, juser, messageText, __instance);
+                    }
+                }
+                catch { }
+
+                // ★ 2026-11-12：NPC 数值面板——独立于好感度开关（施工图 R9：双字段完全隔离）
+                //   即使关掉「主请求好感度」，面板也照常解析；反之亦然。
+                try
+                {
+                    BuWenFanChen.Panel.PanelStore.OnModelReply(
+                        jid, BuWenFanChen.Output.RawReplyStore.Peek());
+                }
+                catch { }
+
+                // ★ 2026-11-07 04:30：E 方案已禁用（UpgradeRounds=0），这里仍登记原始输出——
+                //   开销极小（一个字典写入），留着方便以后重开 E；UpgradeRounds 改成 5 就恢复。
+                try
+                {
+                    var rawForCanon = BuWenFanChen.Output.RawReplyStore.Peek();
+                    if (!string.IsNullOrEmpty(rawForCanon))
+                        BuWenFanChen.History.CanonStore.RememberRawReply(rawForCanon);
+                }
+                catch { }
+
+                // ★ 2026-11-04：本轮处理完，清掉原始输出缓存（避免下一轮误用）
+                try { BuWenFanChen.Output.RawReplyStore.Clear(); } catch { }
 
                 // ★ 2026-10-26：语音诊断——每轮记一行，专门抓「没语音」的问题。
                 //   玩家反馈没声音时，把 语音诊断.log 发来就能看到是
@@ -475,6 +549,9 @@ internal static class AddNpcChatMessagePatch
         if (v1Frame != null)
             final += v1Frame;
 
+        // ★ 2026-11-13 主人要求：AI 腔 / 鱼八股密度统计（只记录，不改 content —— 改了就断 TTS 一致性）
+        try { BuWenFanChen.Output.AiFlavorProbe.Report(final); } catch { }
+
         return (final, cutApplied, dialogueCut);
     }
 
@@ -503,25 +580,14 @@ internal static class AddNpcChatMessagePatch
     ///   是   | AliasConflict   | 不动，只记日志
     /// </summary>
     /// <summary>
-    /// 把 npcRawOutput 里的 content 同步成处理后的文本，并维持 a1ttsv2 的可用性。
-    ///
-    /// ★★ 2026-10-24 16:50 重写（修复外部审计 F1：content 与台本版本分叉）★★
-    ///
-    /// 原 bug 的根子：原来「改 content」和「处理台本」不是原子操作，而且提前返回分支
-    /// 在改完 content 后直接 return，导致 content 是新句、segments 还是原句 → 分叉。
-    ///
-    /// 新原则（两条，也是审计给的方向）：
-    ///   ① 只有【裁段】（真的删了台词）才改 raw.content；
-    ///      折叠空行等排版改动只改 messageText（显示），不动 raw.content ——
-    ///      对白没变，台本也不用变，从根上就不会分叉。
-    ///   ② 一旦改了 raw.content（裁段），台本【必须同步跟随】：
-    ///      能重建就重建，不能重建就清除 —— 旧台本对应已删内容，绝不能留。
-    ///
-    /// 补写开关（fallbackEnabled / allowFallback）只影响「缺台本时要不要主动生成」，
-    /// 不影响「已有台本必须跟随正文」—— 这两件事审计点名要求分开。
+    /// ★ 2026-11-07 主人要求：**整套「补写语音台本」功能已删除**
+    ///   （台本库 BuildA1TtsV2 / 补写 fallback / 修坏 scriptRepair / 控制台开关，全部移除）。
+    /// 这里只剩两件事：
+    ///   ① 裁段时把 content 同步进 raw —— 否则 TTS 读到的还是未裁的原文
+    ///   ② 只要裁到台词，旧台本对应的就是旧正文 → **直接清除**，绝不朗读已删内容（不再重建）
+    /// 模型没给台本、台本解析失败 → 原样交给语音 MOD 自己处理，我们一个字都不造。
     /// </summary>
-    private static string SyncRawContent(string raw, string newContent, bool cutApplied,
-                                         bool dialogueCut, bool allowFallback = true)
+    private static string SyncRawContent(string raw, string newContent, bool cutApplied, bool dialogueCut)
     {
         if (string.IsNullOrEmpty(raw) || newContent == null) return raw;
         var log = BepInEx.Logging.Logger.CreateLogSource("不问凡尘");
@@ -534,15 +600,11 @@ internal static class AddNpcChatMessagePatch
             }
             catch (Exception pe)
             {
-                // ★ 2026-10-26：严格解析失败时，先走 ResponseNormalizer.ParseJson 的修补能力
-                //   （尾逗号/单引号/中文引号，特别是「模型把 <a1tts_v2>{…}</a1tts_v2> 塞进 content
-                //   且内层引号没转义」这种会被花括号扫描带偏的畸形输出）。
-                //   原来这里直接 return raw → 游戏自己解析失败 → content 落到兜底文案
-                //   （玩家看到的「连续几轮重复同一句」就是这么来的）。
+                // 严格解析失败时，先走 ResponseNormalizer.ParseJson 的修补能力（尾逗号/单引号/中文引号等）
                 var repaired = BuWenFanChen.Output.ResponseNormalizer.ParseJson(raw);
                 if (repaired == null)
                 {
-                    log.LogWarning($"[输出] raw JSON 解析失败（{pe.GetType().Name}），content/台本均未同步");
+                    log.LogWarning($"[输出] raw JSON 解析失败（{pe.GetType().Name}），content 未同步");
                     return raw;
                 }
                 node = repaired;
@@ -552,182 +614,44 @@ internal static class AddNpcChatMessagePatch
             if (!obj.ContainsKey("content")) return raw;
 
             var oldContent = obj["content"]?.GetValue<string>() ?? "";
-            // ★ F1 核心：只有裁段才认为 content 变了（折叠空行不改 raw.content）
             var contentChanged = cutApplied && oldContent != newContent;
 
-            // ============ 分支一：裁段（content 改了）============
-            if (contentChanged)
+            if (!contentChanged)
             {
-                obj["content"] = newContent;
-
-                // ★★ 2026-10-24 17:15（修 display_spoken_content_changed）：
-                //   如果【只裁了旁白、台词一个字没动】，台本根本不需要重建 ——
-                //   台本里本来就只有台词，台词没变，台本自然还对得上。
-                //   这种情况下重建反而可能改变分段、制造和语音 MOD 缓存的不一致。
-                if (!dialogueCut)
-                {
-                    log.LogInfo($"[输出] content 已改（只裁旁白：{oldContent.Length} → {newContent.Length} 字），" +
-                                "台词未动 → 台本保持原样（不重建）");
-                    return obj.ToJsonString(new System.Text.Json.JsonSerializerOptions
-                    {
-                        Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
-                    });
-                }
-
-                log.LogInfo($"[输出] content 已改（裁了台词：{oldContent.Length} → {newContent.Length} 字），台本同步跟随");
-
-                var v2RawLen = BuWenFanChen.Output.ResponseNormalizer.MeasureA1TtsV2ValueLength(raw);
-                var state = BuWenFanChen.Output.ResponseNormalizer.InspectA1TtsV2(obj, out var reason, v2RawLen);
-
-                switch (state)
-                {
-                    case A1State.AliasConflict:
-                        // 冲突不动，留给消费端拒绝；至少不额外制造新冲突
-                        log.LogInfo($"[输出] a1ttsv2：裁段但别名冲突（{reason}），台本不重建");
-                        break;
-
-                    case A1State.ExplicitNull:
-                        // 模型明确「本轮不说话」，裁段后仍保留 null
-                        log.LogInfo("[输出] a1ttsv2：裁段但模型显式 null，保留 null");
-                        break;
-
-                    default:
-                        // Valid / StringForm / Invalid / Absent：旧台本对应旧正文 → 重建或清除
-                        var rebuilt = TryBuild(obj, newContent, out var segCount);
-                        if (rebuilt)
-                        {
-                            log.LogInfo($"[输出] a1ttsv2：裁段后重建（原状态 {state}，现 {segCount} 段）");
-                        }
-                        else
-                        {
-                            // 重建失败（生成器读不出完整对白）→ 清除旧台本，绝不读已删内容
-                            obj.Remove("a1ttsv2");
-                            obj.Remove("A1ttsv2");
-                            log.LogInfo($"[输出] a1ttsv2：裁段后无法重建（原状态 {state}），已清除旧台本避免读已删内容");
-                        }
-                        break;
-                }
-
-                return obj.ToJsonString(new System.Text.Json.JsonSerializerOptions
-                {
-                    Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
-                });
-            }
-
-            // ============ 分支二：没裁段（content 不动，台本默认也不动）============
-            log.LogInfo($"[输出] content 未变（{newContent.Length} 字），raw.content 不写回（折叠空行只作用于显示）");
-
-            // 三个开关：没 TTS / 兜底关 / 非第一轮 → 什么都不做
-            // content 没变、台本不动 → 完全一致，安全返回原串
-            if (!TtsPresent())
-            {
-                log.LogInfo("[输出] 未检测到语音 MOD，台本不处理");
-                return raw;
-            }
-            if (!PromptConfig.FallbackEnabled)
-            {
-                log.LogInfo("[输出] 兜底已关闭（fallbackEnabled=false），台本交给 TTS 自己处理");
-                return raw;
-            }
-            if (!allowFallback)
-            {
-                var st0 = BuWenFanChen.Output.ResponseNormalizer.InspectA1TtsV2(obj, out var rs0);
-                log.LogInfo($"[输出] 非第一轮 → 不补写台本（本捕获点 {st0}" +
-                            $"{(rs0 == null ? "" : "，" + rs0)}）");
+                log.LogInfo($"[输出] content 未变（{newContent.Length} 字），raw.content 不写回（折叠空行只作用于显示）");
                 return raw;
             }
 
-            // 正常：处理台本（只补缺失/修坏的，不动已有的有效台本）
-            var v2RawLen2 = BuWenFanChen.Output.ResponseNormalizer.MeasureA1TtsV2ValueLength(raw);
-            var state2 = BuWenFanChen.Output.ResponseNormalizer.InspectA1TtsV2(obj, out var reason2, v2RawLen2);
-            string action = null;
-            var builtV2 = false;
-            var cleared = false;
+            obj["content"] = newContent;
 
-            switch (state2)
+            // 只裁旁白、台词一个字没动 → 台本里本来只有台词，不需要动它
+            if (!dialogueCut)
             {
-                case A1State.AliasConflict:
-                    action = "别名冲突（a1ttsv2 + A1ttsv2 同时存在），不动并跳过语音";
-                    break;
-
-                case A1State.ExplicitNull:
-                    action = "显式 null，保留（本轮不说话）";
-                    break;
-
-                case A1State.Valid:
-                    {
-                        var v2obj = obj["a1ttsv2"] as System.Text.Json.Nodes.JsonObject;
-                        var segs = v2obj?["segments"]?.AsArray();
-                        var segTotal = segs?.Count ?? 0;
-                        var tagCount = 0;
-                        if (segs != null)
-                        {
-                            foreach (var one in segs)
-                            {
-                                var tg = (one as System.Text.Json.Nodes.JsonObject)?["tag"]?.GetValue<string>();
-                                if (!string.IsNullOrWhiteSpace(tg)) tagCount++;
-                            }
-                        }
-                        // ★ 2026-10-24 17:00：记录模型自己吐的 instruct（长度 + 前 40 字）
-                        //   用途：确认模型吐的 instruct 质量，判断我们的 BuildInstruct 有没有必要干预
-                        var insStr = "";
-                        try { insStr = v2obj?["instruct"]?.GetValue<string>() ?? ""; } catch { }
-                        action = $"模型自带有效（{segTotal} 段，{tagCount} 段带 tag，" +
-                                 $"instruct {insStr.Length} 字「{(insStr.Length > 40 ? insStr[..40] + "…" : insStr)}」）";
-                    }
-                    break;
-
-                case A1State.StringForm:
-                    {
-                        var decoded = TryDecodeStringForm(obj);
-                        action = decoded ? "字符串化台本已解码为对象" : "字符串化台本存在但无法解码，保留原样";
-                        if (decoded) builtV2 = true;
-                    }
-                    break;
-
-                case A1State.Absent:
-                    {
-                        var built = TryBuild(obj, newContent, out var segCount);
-                        if (built)
-                        {
-                            builtV2 = true;
-                            action = $"补写（本捕获点 absent，{segCount} 段台词；上游可能已被游戏清洗，不代表模型没吐）";
-                        }
-                        else
-                        {
-                            action = "无台词可补（本轮可能只有旁白）";
-                        }
-                    }
-                    break;
-
-                case A1State.Invalid:
-                    {
-                        var built = TryBuild(obj, newContent, out var segCount);
-                        if (built)
-                        {
-                            builtV2 = true;
-                            action = $"本捕获点无效（{reason2}）→ 重建（{segCount} 段）";
-                        }
-                        else
-                        {
-                            obj.Remove("a1ttsv2");
-                            obj.Remove("A1ttsv2");
-                            cleared = true;
-                            action = $"本捕获点无效（{reason2}）且无可重建台词 → 已清除";
-                        }
-                    }
-                    break;
+                log.LogInfo($"[输出] content 已改（只裁旁白：{oldContent.Length} → {newContent.Length} 字），台词未动 → 台本保持原样");
+                return SerializeRaw(obj);
             }
 
-            if (action != null) log.LogInfo($"[输出] a1ttsv2：{action}");
+            log.LogInfo($"[输出] content 已改（裁了台词：{oldContent.Length} → {newContent.Length} 字），旧台本必须先清掉");
+            var v2RawLen = BuWenFanChen.Output.ResponseNormalizer.MeasureA1TtsV2ValueLength(raw);
+            var state = BuWenFanChen.Output.ResponseNormalizer.InspectA1TtsV2(obj, out var reason, v2RawLen);
 
-            // 只有真正改了对象（补写/重建/解码/清除）才返回新串
-            if (!builtV2 && !cleared) return raw;
-
-            return obj.ToJsonString(new System.Text.Json.JsonSerializerOptions
+            if (state == A1State.AliasConflict)
             {
-                Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
-            });
+                // 冲突交给消费端拒绝，我们不再制造新键
+                log.LogInfo($"[输出] a1ttsv2：裁段但别名冲突（{reason}），不动");
+                return SerializeRaw(obj);
+            }
+            if (state == A1State.ExplicitNull)
+            {
+                log.LogInfo("[输出] a1ttsv2：裁段但模型显式 null，保留 null");
+                return SerializeRaw(obj);
+            }
+
+            // 其余情况：旧台本对应旧正文 → 一律清除（不重建）
+            obj.Remove("a1ttsv2");
+            obj.Remove("A1ttsv2");
+            log.LogInfo($"[输出] a1ttsv2：裁段（原状态 {state}）→ 已清除旧台本，避免朗读已删台词");
+            return SerializeRaw(obj);
         }
         catch (Exception e)
         {
@@ -736,53 +660,13 @@ internal static class AddNpcChatMessagePatch
         }
     }
 
-    /// <summary>从正文重建 a1ttsv2 并写入 obj。返回是否成功。</summary>
-    private static bool TryBuild(System.Text.Json.Nodes.JsonObject obj, string content, out int segCount)
-    {
-        segCount = 0;
-        try
+    /// <summary>把 JsonObject 序列化回字符串（中文不转义）。</summary>
+    private static string SerializeRaw(System.Text.Json.Nodes.JsonObject obj) =>
+        obj.ToJsonString(new System.Text.Json.JsonSerializerOptions
         {
-            var emotion = obj["emotion"]?.GetValue<string>() ?? "";
-            var v2 = BuWenFanChen.Output.ResponseNormalizer.BuildA1TtsV2(content, emotion);
-            if (string.IsNullOrEmpty(v2)) return false;
-            var built = System.Text.Json.Nodes.JsonNode.Parse(v2);
-            // 自检：自己造的东西也必须过同一套契约校验，否则等于把坏台本塞给 TTS
-            if (!BuWenFanChen.Output.ResponseNormalizer.IsValidA1TtsV2(built, out _)) return false;
+            Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        });
 
-            // ★★ 2026-10-24 16:45 修正（外部审计 F2）：
-            //   原来只写小写 a1ttsv2，没清掉已有的 A1ttsv2 →
-            //   裁剪后重建会输出【两个键】→ 消费端直接拒 alias_conflict:a1ttsv2。
-            //   现在：重建即统一成唯一规范键（小写），先删大写再写。
-            obj.Remove("A1ttsv2");
-            obj["a1ttsv2"] = built;
-            segCount = (built as System.Text.Json.Nodes.JsonObject)?["segments"]?.AsArray()?.Count ?? 0;
-            return true;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    /// <summary>把字符串化台本解码成对象写回。返回是否成功。</summary>
-    private static bool TryDecodeStringForm(System.Text.Json.Nodes.JsonObject obj)
-    {
-        try
-        {
-            if (!obj.TryGetPropertyValue("a1ttsv2", out var n) || n is not System.Text.Json.Nodes.JsonValue v) return false;
-            if (!v.TryGetValue<string>(out var str) || string.IsNullOrWhiteSpace(str)) return false;
-            var inner = System.Text.Json.Nodes.JsonNode.Parse(str);
-            if (!BuWenFanChen.Output.ResponseNormalizer.IsValidA1TtsV2(inner, out _)) return false;
-            obj["a1ttsv2"] = inner;
-            return true;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    /// <summary>
     /// dump 是诊断副作用，失败绝不能阻断核心处理（审计 F9）。
     /// </summary>
     private static void DumpSafe(string messageText, string processed, string npcRawOutput, int promptTurnId)
@@ -883,7 +767,11 @@ internal static class AddNpcChatMessagePatch
             if (replyCount > 0)
             {
                 // 已有真实对话 → 这个 NPC 聊过了，开场白多余
-                GreetingFilter.RemoveLastPublic(__instance);
+                // ★ 2026-10-31：不当场删（这条可能正被 TTS 念，删了会把它卡死），
+                //   改成记账，下次进对话时再删。
+                GreetingFilter.MarkPendingRemoval(Memory.MemoryEngine.GetNpcCfgId(__instance));
+                BepInEx.Logging.Logger.CreateLogSource("不问凡尘")
+                    .LogInfo("[开场白] 延后删除：本次先留着让语音念完，下次进对话再删");
             }
             else
             {

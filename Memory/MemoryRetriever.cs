@@ -29,13 +29,14 @@ public static class MemoryRetriever
     /// 排除最近 N 条 chunk：游戏的 history 已经带了最近若干轮对话，
     /// 我们再检索出来就是重复注入（浪费 token + 干扰注意力）。
     ///
-    /// ★ 2026-10-25 主人定：8 → 3 → 2。
-    ///   实测游戏 history 只带 295 字 ≈ 2 条消息（玩家问一句 + 角色答一句 = 1 轮），
-    ///   而 chunk 总共才 2~15 条 → 排 8 条（约 4 轮）等于把「唯一有内容的」也扔了，检索必然空。
-    ///   排 2 条正好等于 history 实际带的量，不多排也不少排。
+    /// ★ 2026-10-25 旧结论（已过时）：当时实测 history 只带 295 字 ≈ 2 条消息，所以定成 2。
+    /// ★ 2026-11-05 抓包实测（旁路代理）：游戏 history 实际带 **约 8 轮（16 条消息）**，
+    ///   总量 6500~7400 字。旧的 2 太小 → 最近 3~8 轮会被重复检索出来，
+    ///   实测「相关回忆」742 字里有 4 段和 history 完全重复。
+    ///   现改为 16（8 轮 × 2 条）。history 长度若变化，这里要跟着调。
     ///   （这个值主人自己会调，不进 config.json）
     /// </summary>
-    public static int ExcludeRecentChunks = 2;
+    public static int ExcludeRecentChunks = 16;
 
     /// <summary>
     /// 诊断日志开关。
@@ -151,13 +152,21 @@ public static class MemoryRetriever
         }
 
         // ④ facts 单独 BM25（不参与 RRF，避免长文本压过短事实）
+        // ★ 2026-11-05：排除 4~5 级事实 —— 它们已经在「长期记忆·关键事实」里固定注入，
+        //   这里再检索出来就是同一句说两遍（白占预算 + 让模型过度强调）。
+        //   只让 1~3 级的"次要事实"走检索。
         var factLeft = Math.Max(0, topK - result.Count);
         if (factLeft > 0 && mem.Facts.Count > 0)
         {
-            foreach (var (docIdx, score) in cache.FactIndex.Search(query, factLeft))
+            int added = 0;
+            foreach (var (docIdx, score) in cache.FactIndex.Search(query, factLeft * 2))
             {
+                if (added >= factLeft) break;
                 if (docIdx < 0 || docIdx >= mem.Facts.Count) continue;
-                result.Add(new RetrievedItem { IsFact = true, Fact = mem.Facts[docIdx], Score = score });
+                var f = mem.Facts[docIdx];
+                if (f.Importance >= 4) continue;   // 已固定注入，跳过
+                result.Add(new RetrievedItem { IsFact = true, Fact = f, Score = score });
+                added++;
             }
         }
 
@@ -302,23 +311,35 @@ public static class MemoryRetriever
     {
         if (items == null || items.Count == 0) return "";
 
-        // ① 按相关度降序挑选：预算内优先保住最相关的
-        var selected = new List<(RetrievedItem Item, string Line)>();
+        // ★ 2026-11-05：按类型分配额，避免某一类把预算吃光。
+        //   实测问题：抓包 17 轮里「相关回忆」全是 [对话]，摘要句和事实一条都没进——
+        //   因为原文 chunk 数量最多、相关度高，把 800 字预算抢光了。
+        //   而原文大多在游戏的 history 里已经有了，摘要句/事实才是 history 里没有的。
+        //   配额：事实 3 条 / 摘要 3 条 / 原文 2 条；总预算仍受 maxChars 约束。
+        var facts = items.Where(i => i.IsFact)
+                         .OrderByDescending(i => i.Score).Take(3).ToList();
+        var summaries = items.Where(i => !i.IsFact && i.Chunk != null && i.Chunk.Kind == ChunkKind.Summary)
+                             .OrderByDescending(i => i.Score).Take(3).ToList();
+        var dialogs = items.Where(i => !i.IsFact && i.Chunk != null && i.Chunk.Kind != ChunkKind.Summary)
+                           .OrderByDescending(i => i.Score).Take(2).ToList();
+
+        // 装填顺序：事实 → 摘要 → 原文（信息密度高的先占位）
+        var picked = new List<RetrievedItem>();
         var used = 0;
-        foreach (var item in items.OrderByDescending(i => i.Score))
+        foreach (var item in facts.Concat(summaries).Concat(dialogs))
         {
             var line = BuildLine(item);
-            if (used + line.Length > maxChars) continue;   // 这条塞不下，试下一条（不 break，避免浪费预算）
-            selected.Add((item, line));
+            if (used + line.Length > maxChars) continue;   // 这条塞不下，试下一条
+            picked.Add(item);
             used += line.Length;
         }
-        if (selected.Count == 0) return "";
+        if (picked.Count == 0) return "";
 
-        // ② 输出按相关度升序：最相关的放最后
+        // 输出按相关度升序：最相关的放最后（靠近后续内容）
         var sb = new StringBuilder();
         sb.AppendLine("## 相关回忆");
-        foreach (var (_, line) in selected.OrderBy(x => x.Item.Score))
-            sb.AppendLine(line);
+        foreach (var item in picked.OrderBy(x => x.Score))
+            sb.AppendLine(BuildLine(item));
         return sb.ToString();
     }
 
@@ -328,7 +349,7 @@ public static class MemoryRetriever
         if (item.IsFact)
         {
             var f = item.Fact;
-            line = $"- [事实·{f.Importance}级] {f.Text}";
+            line = $"- [{f.Importance}] {f.Text}";
         }
         else
         {

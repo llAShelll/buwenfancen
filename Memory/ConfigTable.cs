@@ -417,6 +417,40 @@ public static class ConfigTable
             System.Reflection.BindingFlags.Public |
             System.Reflection.BindingFlags.NonPublic;
 
+        // ⓪ ★★ 2026-11-08：按类型全量查找 Tables 实例。
+        //   `Resources.FindObjectsOfTypeAll` 不受「对象是否激活」限制，能拿到场景里所有该类型的对象；
+        //   这是今天在输入框那边验证过的方式（同样用它拿到了 CommonInputField）。
+        //   为什么这个能修「拿不到 TbNpcBaseCfg 表」：原来靠 ① 找静态属性 T/Instance，
+        //   但实测 242 个属性里根本没有单例成员 → 永远拿不到；而 Tables 实例在场景里是存在的。
+        try
+        {
+            var il2t0 = Il2CppInterop.Runtime.Il2CppType.Of<LubanDatas.Tables>();
+            var objs0 = UnityEngine.Resources.FindObjectsOfTypeAll(il2t0);
+            if (probe != null) probe.AppendLine($"  [配置表] 按类型全量查到 {objs0?.Count ?? 0} 个 Tables 对象");
+            if (objs0 != null)
+            {
+                foreach (var o0 in objs0)
+                {
+                    if (o0 == null) continue;
+                    try
+                    {
+                        var inst0 = o0.TryCast<LubanDatas.Tables>();
+                        if (inst0 != null)
+                        {
+                            _tables = inst0;
+                            if (probe != null) probe.AppendLine("  [配置表] 已用全量查找拿到 Tables 实例");
+                            return _tables;
+                        }
+                    }
+                    catch { }
+                }
+            }
+        }
+        catch (Exception e00)
+        {
+            if (probe != null) probe.AppendLine($"  [配置表] 全量查找失败: {e00.GetType().Name}: {e00.Message}");
+        }
+
         // ① ★ Il2Cpp 侧遍历属性：typeof() 拿到的是代理类，看不到 Il2Cpp 的静态属性
         //    必须用 Il2CppType.Of<T>() 再遍历
         try
@@ -537,38 +571,217 @@ public static class ConfigTable
         return _tables;
     }
 
+    /// <summary>反认出来的「角色表」真实属性名（不同游戏版本可能不叫 TbNpcBaseCfg）</summary>
+    private static string _resolvedNpcTableName;
+    private static bool _guessLogged;
+
     /// <summary>拿某张表的对象（如 "TbNpcBaseCfg"）</summary>
     public static object GetTable(string tableProp, StringBuilder probe = null, bool forceRetry = false)
     {
         var tables = GetTables(probe, forceRetry);
         if (tables == null) return null;
 
-        // ★ 遍历实例属性找名字（GetProperty 对 IL2CPP 代理类不可靠：
-        //   242 个属性都在，但 GetProperty(name, F) 可能命中不了）
+        // ① 精确名
+        var hit = FindTableByName(tables, tableProp, probe);
+        if (hit != null) return hit;
+
+        // ② 只有角色表值得兜底（其它表名字固定）
+        if (tableProp != "TbNpcBaseCfg") return null;
+
+        // ③ 用上次反认出来的名字
+        if (!string.IsNullOrEmpty(_resolvedNpcTableName) && _resolvedNpcTableName != tableProp)
+        {
+            hit = FindTableByName(tables, _resolvedNpcTableName, probe);
+            if (hit != null)
+            {
+                if (probe != null) probe.AppendLine($"  [配置表] 用反认名取到：{_resolvedNpcTableName}");
+                return hit;
+            }
+        }
+
+        // ④ 模糊 + 按内容反认
+        return GuessNpcTable(tables, probe);
+    }
+
+    /// <summary>
+    /// 拿某张表的对象（如 "TbNpcBaseCfg"）—— 2026-10-31 修正反射源。
+    ///
+    /// ★ 关键：`tables.GetType().GetProperties()` 只有 3 个属性（IL2CPP 代理元数据），
+    ///   真正的 242 个配置表属性挂在 `Il2CppType.Of&lt;LubanDatas.Tables&gt;()` 上。
+    ///   之前一直「拿不到 TbNpcBaseCfg 表」就是这里用错了反射对象（本地和玩家都一样）。
+    /// </summary>
+    private static object FindTableByName(object tables, string prop, StringBuilder probe)
+    {
+        // ① Il2CppType（242 个业务属性）
+        try
+        {
+            var il2t = Il2CppInterop.Runtime.Il2CppType.Of<LubanDatas.Tables>();
+            foreach (var p in il2t.GetProperties())
+            {
+                if ((p.Name ?? "") != prop) continue;
+                object v = null;
+                // ★ 2026-11-08：属性可能是【实例】成员，GetValue(null) 会报
+                //   「Non-static method requires a target」；先试拿到的 Tables 实例，再退回 null。
+                if (tables is Il2CppSystem.Object tablesIl2)
+                {
+                    try { v = p.GetValue(tablesIl2); } catch { }
+                }
+                if (v == null)
+                {
+                    try { v = p.GetValue(null); }
+                    catch (Exception e0)
+                    {
+                        if (probe != null) probe.AppendLine($"  [配置表] GetTable({prop}) 取值异常: {e0.Message}");
+                        continue;
+                    }
+                }
+                // ★★ 2026-11-08 关键：Il2Cpp 的 PropertyInfo.GetValue 返回的是
+                //   `Il2CppSystem.Object` 基类包装（诊断日志证实：属性只有 ObjectClass/Pointer/WasCollected），
+                //   不转回真类型的话，后面找 DataList 永远找不到。这里按表类型 TryCast。
+                if (v is Il2CppSystem.Object vWrap)
+                {
+                    try
+                    {
+                        var casted = vWrap.TryCast<LubanDatas.TbNpcBaseCfg>();
+                        if (casted != null)
+                        {
+                            v = casted;
+                            if (probe != null) probe.AppendLine($"  [配置表] GetTable({prop}) 已转成 {typeof(LubanDatas.TbNpcBaseCfg).Name}");
+                        }
+                        else if (probe != null)
+                        {
+                            probe.AppendLine($"  [配置表] GetTable({prop}) TryCast 失败，仍是 Il2CppSystem.Object");
+                        }
+                    }
+                    catch (Exception ec)
+                    {
+                        if (probe != null) probe.AppendLine($"  [配置表] GetTable({prop}) TryCast 异常: {ec.Message}");
+                    }
+                }
+                if (probe != null) probe.AppendLine($"  [配置表] GetTable({prop}) → {(v == null ? "null" : v.GetType().Name)}");
+                if (v != null) return v;
+            }
+            if (probe != null) probe.AppendLine($"  [配置表] GetTable({prop}) Il2Cpp 属性没命中");
+        }
+        catch (Exception e1)
+        {
+            if (probe != null) probe.AppendLine($"  [配置表] Il2Cpp 遍历异常: {e1.Message}");
+        }
+
+        // ② 实例属性（兼容：极少数情况下代理类型会带业务属性）
         try
         {
             foreach (var p in tables.GetType().GetProperties(FI))
             {
-                if (p.Name != tableProp) continue;
+                if (p.Name != prop) continue;
                 object v = null;
-                try { v = p.GetValue(tables); }
-                catch (Exception e0)
+                try { v = p.GetValue(tables); } catch { continue; }
+                if (v != null)
                 {
-                    if (probe != null) probe.AppendLine($"  [配置表] GetTable({tableProp}) 取值异常: {e0.Message}");
-                    continue;
+                    if (probe != null) probe.AppendLine($"  [配置表] GetTable({prop}) 实例命中");
+                    return v;
                 }
-                if (probe != null) probe.AppendLine($"  [配置表] GetTable({tableProp}) → {(v == null ? "null" : v.GetType().Name)}");
-                if (v != null) return v;
-            }
-            if (probe != null)
-            {
-                probe.AppendLine($"  [配置表] GetTable({tableProp}) 遍历属性没命中，共 {tables.GetType().GetProperties(FI).Length} 个属性");
             }
         }
-        catch (Exception e1)
+        catch { }
+        return null;
+    }
+
+    /// <summary>
+    /// 兜底：不认识名字时，从内容反认「角色表」。
+    /// 判据：名字含 Npc（先过滤，避免给 242 个属性都取值）
+    ///       + 有 DataList + 行数 &gt; 0 + 第一行有 NpcName 字段。
+    /// 认出来后记住真实属性名，后续直接用。
+    /// </summary>
+    private static object GuessNpcTable(object tables, StringBuilder probe)
+    {
+        try
         {
-            if (probe != null) probe.AppendLine($"  [配置表] GetTable 异常: {e1.Message}");
+            object fallback = null;
+            string fallbackName = null;
+            Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Il2CppSystem.Reflection.PropertyInfo> props = null;
+            try
+            {
+                var il2t = Il2CppInterop.Runtime.Il2CppType.Of<LubanDatas.Tables>();
+                props = il2t.GetProperties();
+            }
+            catch { }
+
+            if (props != null)
+            {
+                foreach (var p in props)
+                {
+                    var nm = p.Name ?? "";
+                    if (nm.IndexOf("Npc", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    object v = null;
+                    try { v = p.GetValue(null); } catch { continue; }
+                    if (v == null) continue;
+                    if (LooksLikeNpcTable(v))
+                    {
+                        _resolvedNpcTableName = nm;
+                        if (!_guessLogged)
+                        {
+                            _guessLogged = true;
+                            try
+                            {
+                                BepInEx.Logging.Logger.CreateLogSource("不问凡尘")
+                                    .LogWarning($"[配置表] 没找到 TbNpcBaseCfg，已反认到角色表：{nm}（下次直接用这个名字）");
+                            }
+                            catch { }
+                        }
+                        if (probe != null) probe.AppendLine($"  [配置表] ★ 反认到角色表：{nm}");
+                        return v;
+                    }
+                    if (fallback == null) { fallback = v; fallbackName = nm; }
+                }
+            }
+            if (fallback != null)
+            {
+                _resolvedNpcTableName = fallbackName;
+                if (probe != null) probe.AppendLine($"  [配置表] 模糊命中（未验证 NpcName 字段）：{fallbackName}");
+                return fallback;
+            }
+            if (probe != null) probe.AppendLine("  [配置表] 兜底也失败：没有名字含 Npc 的表");
         }
+        catch (Exception e)
+        {
+            if (probe != null) probe.AppendLine($"  [配置表] 反认异常: {e.Message}");
+        }
+        return null;
+    }
+
+    /// <summary>这张表像不像角色表：有 DataList、行数 &gt; 0、第一行有 NpcName</summary>
+    private static bool LooksLikeNpcTable(object table)
+    {
+        try
+        {
+            var dl = GetMember(table, "DataList");
+            if (dl == null) return false;
+            var cntObj = GetMember(dl, "Count");
+            var cnt = 0;
+            try { cnt = Convert.ToInt32(cntObj ?? "0"); } catch { }
+            if (cnt <= 0) return false;
+            var getItem = dl.GetType().GetMethod("get_Item", new[] { typeof(int) });
+            if (getItem == null) return false;
+            var row = getItem.Invoke(dl, new object[] { 0 });
+            if (row == null) return false;
+            return GetMember(row, "NpcName") != null;
+        }
+        catch { return false; }
+    }
+
+    /// <summary>按名字读属性或字段（找不到返回 null）</summary>
+    private static object GetMember(object obj, string name)
+    {
+        if (obj == null) return null;
+        try
+        {
+            var p = obj.GetType().GetProperty(name, FI);
+            if (p != null) return p.GetValue(obj);
+            var f = obj.GetType().GetField(name, FI);
+            if (f != null) return f.GetValue(obj);
+        }
+        catch { }
         return null;
     }
 
@@ -1068,6 +1281,42 @@ else if (pn.Equals("Value", StringComparison.OrdinalIgnoreCase)) val = p.GetValu
         return ReadInt(GetRow("TbNpcBaseCfg", id), "Age");
     }
 
+    // ==================== ★ 2026-11-13 动态年龄 ====================
+    // 配置表的 Age 是【开局年龄】，游戏里角色会随世界时间增长（纪澜之 130 → 10 年后 140）。
+    // 当前年龄 = 配置表 Age + 游戏已过年数（GameTime.ElapsedYears）。
+    private static int _elapsedYears = -1;
+    private static string ElapsedYearsPath =>
+        System.IO.Path.Combine(PromptConfig.Dir, "elapsed_years.json");
+
+    /// <summary>主线程写入「游戏已过年数」（CaptureRelations 时从 GameWorld.CurrentGameTime 读）。</summary>
+    public static void SetElapsedYears(int y)
+    {
+        if (y < 0) return;
+        _elapsedYears = y;
+        try { System.IO.File.WriteAllText(ElapsedYearsPath, y.ToString()); } catch { }
+    }
+
+    /// <summary>游戏已过年数（内存缓存 → 文件缓存 → 0）。</summary>
+    public static int GetElapsedYears()
+    {
+        if (_elapsedYears >= 0) return _elapsedYears;
+        try
+        {
+            if (System.IO.File.Exists(ElapsedYearsPath))
+                return _elapsedYears = int.Parse(System.IO.File.ReadAllText(ElapsedYearsPath).Trim());
+        }
+        catch { }
+        return 0;
+    }
+
+    /// <summary>当前年龄 = 配置表初始 Age + 游戏已过年数（控制台重新抓取、世界书「角色自身」都用它）。</summary>
+    public static int GetCurrentAge(string npcCfgId)
+    {
+        var baseAge = GetAge(npcCfgId);
+        if (baseAge <= 0) return baseAge;
+        return baseAge + System.Math.Max(0, GetElapsedYears());
+    }
+
     /// <summary>兴趣名（物品类型 ID 列表 → TbItemType.Name 列表）</summary>
     public static List<string> GetInterestNames(IEnumerable<string> ids)
     {
@@ -1081,6 +1330,36 @@ else if (pn.Equals("Value", StringComparison.OrdinalIgnoreCase)) val = p.GetValu
             if (!string.IsNullOrEmpty(n) && !result.Contains(n)) result.Add(n);
         }
         return result;
+    }
+
+    /// <summary>
+    /// ★ 2026-11-13：NPC 性别（TbNpcBaseCfg.Gender → "男" / "女" / ""）。
+    /// 用途：性格面板只对女性角色开放（男性 NPC 不显示面板、不注入两段）。
+    /// 字段可能是 int（1/2）或字符串，两种都兼容；认不出来返回空（面板照常显示，不误伤）。
+    /// </summary>
+    public static string GetGender(string npcCfgId)
+    {
+        try
+        {
+            if (!int.TryParse(npcCfgId, out var id)) return "";
+            var row = GetRow("TbNpcBaseCfg", id);
+            if (row == null) return "";
+            var raw = ReadString(row, "Gender").Trim();
+            if (string.IsNullOrEmpty(raw)) raw = ReadInt(row, "Gender").ToString();
+            return NormalizeGender(raw);
+        }
+        catch { return ""; }
+    }
+
+    private static string NormalizeGender(string raw)
+    {
+        if (string.IsNullOrEmpty(raw)) return "";
+        if (raw.Contains("男") || raw.IndexOf("male", StringComparison.OrdinalIgnoreCase) >= 0) return "男";
+        if (raw.Contains("女") || raw.IndexOf("female", StringComparison.OrdinalIgnoreCase) >= 0) return "女";
+        // 纯数字约定：1 = 男 / 2 = 女（常见；认不出返回空，不误伤）
+        if (raw == "1") return "男";
+        if (raw == "2") return "女";
+        return "";
     }
 
     /// <summary>一次性拿全（供角色世界书用）：宗门/境界/年龄</summary>

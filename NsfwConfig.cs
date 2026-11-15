@@ -84,6 +84,8 @@ namespace BuWenFanChen
         private static long _mtKeywords, _mtArmor, _mtGuifan, _mtCustom;
         private static readonly Dictionary<string, int> _latchLeft = new();
         private static readonly object _lock = new();
+        /// <summary>★ 2026-11-12：最近一次 ShouldInject 的结果（按 npcId）——面板判定用它，不重复调（不重复扣锁存）</summary>
+        private static readonly Dictionary<string, bool> _lastHit = new();
 
         public static void Load(string mode, int latchRounds)
         {
@@ -218,12 +220,12 @@ namespace BuWenFanChen
 
         public static bool ShouldInject(string npcId, string playerText)
         {
-            if (Mode == "off") return false;
-            if (Mode == "always") return true;
+            var id = npcId ?? "";
+            if (Mode == "off") { _lastHit[id] = false; return false; }
+            if (Mode == "always") { _lastHit[id] = true; return true; }
 
             ReloadIfChanged();
 
-            var id = npcId ?? "";
             var text = playerText ?? "";
 
             var hitA = 0;
@@ -234,28 +236,55 @@ namespace BuWenFanChen
             if (hitA >= 1 || hitB >= 2)
             {
                 _latchLeft[id] = LatchRounds;
+                _lastHit[id] = true;
                 return true;
             }
 
             if (_latchLeft.TryGetValue(id, out var left) && left > 0)
             {
                 _latchLeft[id] = left - 1;
+                _lastHit[id] = true;
                 return true;
             }
+            _lastHit[id] = false;
             return false;
         }
+
+        /// <summary>★ 2026-11-12：最近一次 ShouldInject 的结果（给面板判定用；不重复调用、不重复扣锁存）</summary>
+        public static bool LastHit(string npcId)
+            => npcId != null && _lastHit.TryGetValue(npcId, out var v) && v;
 
         public static int LatchLeft(string npcId)
             => (npcId != null && _latchLeft.TryGetValue(npcId, out var v)) ? v : 0;
 
-        public static string BuildBlock()
+        public static string BuildBlock(string npcId = null)
         {
             ReloadIfChanged();
             var sb = new StringBuilder();
-            if (!string.IsNullOrEmpty(_armor))
+
+            // ★ 2026-11-13 P2：养成模式 → 剥掉原【玩法授权】段，按面板三值重写（绑养成模式，不单独加开关）
+            bool gating = false;
+            try
+            {
+                gating = !string.IsNullOrEmpty(npcId)
+                         && PromptConfig.PanelEnabled
+                         && !PromptConfig.HideNsfw
+                         && PromptConfig.PanelNsfwMode == "growth";
+            }
+            catch { }
+
+            var armor = _armor;
+            if (gating) armor = StripAuthorizationSection(armor);
+
+            if (!string.IsNullOrEmpty(armor))
             {
                 sb.AppendLine("【高级破甲】");
-                sb.AppendLine(_armor);
+                sb.AppendLine(armor.Trim());
+            }
+            if (gating)
+            {
+                var auth = BuildAuthorizationBlock(npcId);
+                if (!string.IsNullOrEmpty(auth)) sb.AppendLine(auth);
             }
             if (!string.IsNullOrEmpty(_guifan))
             {
@@ -267,6 +296,138 @@ namespace BuWenFanChen
                 sb.AppendLine("【用语规范·自定义】");
                 sb.AppendLine(_custom);
             }
+            return sb.ToString().Trim();
+        }
+
+        /// <summary>剥掉原文里的【玩法授权】段（从该标题行到下一条【标题】前；按段切块，不做字符串替换）</summary>
+        private static string StripAuthorizationSection(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return text;
+            var lines = text.Replace("\r\n", "\n").Split('\n');
+            var sb = new StringBuilder();
+            bool skipping = false;
+            foreach (var raw in lines)
+            {
+                var trimmed = raw.TrimStart();
+                if (trimmed.StartsWith("【玩法授权】", StringComparison.Ordinal))
+                {
+                    skipping = true;
+                    continue;
+                }
+                if (skipping)
+                {
+                    if (trimmed.StartsWith("【", StringComparison.Ordinal)) skipping = false;   // 下一段开始
+                    else continue;                                                             // 仍在本段
+                }
+                sb.AppendLine(raw);
+            }
+            return sb.ToString().Trim();
+        }
+
+        /// <summary>★ 2026-11-13 §4.6.5：上一轮玩法授权档位（档位跃变时加过渡句）</summary>
+        private static readonly Dictionary<string, int> _prevAuthTier = new();
+
+        /// <summary>★ 2026-11-13 P2：按面板数值生成【玩法授权】段（施工图 §4.6.4 五档 + 强度类追加；shame 只进演法基调）</summary>
+        private static string BuildAuthorizationBlock(string npcId)
+        {
+            int open = 30, sub = 0, cor = 0, shame = 0;
+            try
+            {
+                var st = BuWenFanChen.Panel.PanelStore.Peek(npcId);
+                if (st != null && st.Values != null && st.Values.Length >= 8)
+                {
+                    open = Math.Clamp(st.Values[6], 0, 100);
+                    sub = Math.Clamp(st.Values[4], 0, 100);
+                    cor = Math.Clamp(st.Values[7], 0, 100);
+                    shame = Math.Clamp(st.Values[5], 0, 100);
+                }
+            }
+            catch { }
+
+            string tier, allow, forbid, tone;
+            if (open <= 20)
+            {
+                tier = "守礼档";
+                allow = "私下常规（拥抱、亲吻、脱衣）";
+                forbid = "任何带「被看见」风险的玩法（窗边、半掩、野外、隔墙有人）、束缚、蒙眼";
+                tone = "她会当场拒绝，而且是真的不高兴（不是欲拒还迎）；露出在她眼里是羞辱，不是情趣";
+            }
+            else if (open <= 40)
+            {
+                tier = "松动档";
+                allow = "私下常规、半褪、蒙眼、轻微束缚（仅限私密场合）";
+                forbid = "任何可能被看见的玩法（窗边、半掩、野外、隔墙有人）";
+                tone = "她会慌、会立刻遮住、会要求「把帘子拉上」；只在她确认安全的前提下配合";
+            }
+            else if (open <= 60)
+            {
+                tier = "越界档";
+                allow = "私下常规、半褪、蒙眼、轻微束缚、露出（窗边/半掩，坚持「只许你看」）";
+                forbid = "半公开（野外、隔墙有人、被人听到动静）、公开（多人场合、故意展示）";
+                tone = "禁止项她会用「改天」「换个地方」「今天不行」推脱，或者红着脸把话岔开";
+            }
+            else if (open <= 80)
+            {
+                tier = "半公开档";
+                allow = "以上全部，加野外、隔墙有人、被人听到动静";
+                forbid = "公开（多人场合、故意展示）";
+                tone = "被发现时她的反应是「怕但兴奋」；要求公开会犹豫着找理由拖，但不会一口回绝";
+            }
+            else
+            {
+                tier = "公开档";
+                allow = "全部，包括被人看见、多人场合、故意展示";
+                forbid = "无";
+                tone = "她不遮，还会主动要求被看；被撞见反而更来劲";
+            }
+
+            // 强度类 / 崩坏类（§1.3.2 门槛：场景类看开放、强度类看开放+服从、崩坏类看开放+崩坏）
+            var extra = new List<string>();
+            if (open >= 21 && sub >= 40) extra.Add("SM / 轻度调教");
+            if (open >= 41 && sub >= 60) extra.Add("强制 / 命令式玩法");
+            if (open >= 61 && sub >= 70) extra.Add("痛感 / 惩罚向");
+            if (open >= 41 && cor >= 30) extra.Add("触手 / 催眠（失能）");
+            if (open >= 61 && cor >= 40) extra.Add("妊娠 / 产卵 / 乱伦");
+            if (open >= 81 && cor >= 50) extra.Add("直播凌辱");
+            if (open >= 81 && cor >= 60) extra.Add("肉便器化 / 精神崩坏");
+            if (extra.Count > 0) allow += "；另允许：" + string.Join("、", extra);
+
+            string shameLine;
+            if (shame <= 20) shameLine = "她能自持，脸红但话不乱";
+            else if (shame <= 40) shameLine = "她会脸红、会遮、话说一半停";
+            else if (shame <= 60) shameLine = "她嘴上还矜持，身体先软了";
+            else if (shame <= 80) shameLine = "她一边羞得不行、一边又忍不住要";
+            else shameLine = "她几乎不遮了，但身上那点羞意还在";
+
+            // ★ 2026-11-13 §4.6.5：档位跃变那一轮加过渡句（40→41 这类硬边界不要突变）
+            int tierIdx = open <= 20 ? 0 : open <= 40 ? 1 : open <= 60 ? 2 : open <= 80 ? 3 : 4;
+            string transition = "";
+            try
+            {
+                lock (_lock)
+                {
+                    if (_prevAuthTier.TryGetValue(npcId, out var pt) && pt != tierIdx)
+                    {
+                        transition = tierIdx > pt
+                            ? "（她的尺度正在变宽——上一档还只肯在私下，这一档已经敢往窗边去了。演的时候把这点变化写出来。）"
+                            : "（她的尺度在收——上一档还敢的地方，这一档她会退回来。别当她没变。）";
+                    }
+                    _prevAuthTier[npcId] = tierIdx;
+                }
+            }
+            catch { }
+
+            var sb = new StringBuilder();
+            sb.AppendLine("【玩法授权】（本轮 · 以她此刻的接受度为准）");
+            sb.AppendLine($"开放度 {open} · {tier}");
+            sb.AppendLine();
+            sb.AppendLine("允许：" + allow);
+            sb.AppendLine("禁止：" + forbid);
+            sb.AppendLine();
+            sb.AppendLine("【演法基调】羞耻 " + shame + " —— " + shameLine + "。");
+            sb.AppendLine("允许的玩法她也可能脸红、会遮、话说一半停——不要把「敢做」演成「不在乎」。");
+            sb.AppendLine("底线禁忌与角色卡里的硬底线不因本段改变（R6）。");
+            if (!string.IsNullOrEmpty(transition)) sb.AppendLine(transition);
             return sb.ToString().Trim();
         }
 

@@ -184,6 +184,8 @@ public static class CardFields
         var obj = new System.Text.Json.Nodes.JsonObject();
         foreach (var sec in Sections)
         {
+            // ★ 2026-11-09：过审模式——角色卡表单里不出现 NSFW 分区
+            if (PromptConfig.HideNsfw && sec == "NSFW") continue;
             var arr = new System.Text.Json.Nodes.JsonArray();
             foreach (var f in Table[sec])
             {

@@ -173,6 +173,32 @@ public static class IntimacyJudge
         catch { }
     }
 
+    /// <summary>
+    /// ★ 2026-11-04：主请求模式 —— 模型在主回复 JSON 里已经给了 intimacy.delta，
+    /// 这里只负责记录 + 存 pending（下一轮由 TakePending/ApplyToGame 真正加减）。
+    /// 由 Output.MainIntimacyProbe 调用。
+    /// </summary>
+    public static void SubmitFromMainRequest(string cfgId, int delta, string reason)
+    {
+        try
+        {
+            if (!PromptConfig.AutoIntimacyEnabled) return;
+            if (string.IsNullOrEmpty(cfgId) || delta == 0) return;
+
+            var up = Math.Clamp(PromptConfig.AutoIntimacyMaxUp, 1, 20);
+            var down = Math.Clamp(PromptConfig.AutoIntimacyMaxDown, 1, 20);
+            delta = Math.Clamp(delta, -down, up);
+
+            RecordDelta(cfgId, delta);
+            lock (_lock) _pending[cfgId] = delta;
+            Log($"[好感] 主请求给出 {delta:+0;-0}（{(string.IsNullOrEmpty(reason) ? "无理由" : reason)}）→ 等下一轮应用");
+        }
+        catch (Exception e)
+        {
+            Log($"[好感] 主请求存 pending 异常：{e.GetType().Name}: {e.Message}");
+        }
+    }
+
     /// <summary>请求侧（主线程）取走上一轮判断出来的 delta（取走即清空）。</summary>
     public static int? TakePending(string cfgId)
     {
@@ -198,12 +224,52 @@ public static class IntimacyJudge
         {
             if (npc == null || delta == 0) return;
             delta = Math.Clamp(delta, -Math.Clamp(PromptConfig.AutoIntimacyMaxDown, 1, 20), Math.Clamp(PromptConfig.AutoIntimacyMaxUp, 1, 20));
-            var m = npc.GetType().GetMethod("AddIntimacy");
+
+            // ★ 2026-11-10 修（游戏更新后好感度"控制台有给、游戏里没变动"）：
+            //   实测日志 `[好感] 应用失败：TargetParameterCountException: Parameter count mismatch.`
+            //   —— 游戏更新把 AddIntimacy 的参数个数改了，旧代码硬编 1~2 个参数，调不动。
+            //   现在：找这个方法（兼容重载，取参数最少的那个）→ 按真实参数个数构造默认值 →
+            //   第一次调用时把真实签名打进日志，以后排查有据可查。
+            System.Reflection.MethodInfo m = null;
+            try
+            {
+                foreach (var cand in npc.GetType().GetMethods())
+                {
+                    if (cand == null || cand.Name != "AddIntimacy") continue;
+                    if (m == null || cand.GetParameters().Length < m.GetParameters().Length) m = cand;
+                }
+            }
+            catch { }
             if (m == null) { Log("[好感] 找不到 AddIntimacy 方法"); return; }
+
             var ps = m.GetParameters();
-            object[] args = ps.Length >= 2
-                ? new object[] { delta, Enum.ToObject(ps[1].ParameterType, 0) }
-                : new object[] { delta };
+            var args = new object[ps.Length];
+            if (ps.Length > 0)
+            {
+                var p0 = ps[0].ParameterType;
+                args[0] = p0 == typeof(int) ? (object)delta
+                        : p0.IsEnum ? Enum.ToObject(p0, delta)
+                        : (object)delta;
+            }
+            for (int i = 1; i < ps.Length; i++)
+            {
+                var pt = ps[i].ParameterType;
+                if (pt.IsEnum) args[i] = Enum.ToObject(pt, 0);
+                else if (pt == typeof(bool)) args[i] = false;
+                else if (pt == typeof(int)) args[i] = 0;
+                else if (pt == typeof(string)) args[i] = null;
+                else if (pt.IsValueType) args[i] = Activator.CreateInstance(pt);
+                else args[i] = null;
+            }
+
+            if (!_sigLogged)
+            {
+                _sigLogged = true;
+                var sig = new System.Text.StringBuilder();
+                foreach (var p in ps) sig.Append(p.ParameterType.Name).Append(' ').Append(p.Name).Append(", ");
+                Log("[好感] AddIntimacy 签名（" + ps.Length + " 参数）：" + sig.ToString().TrimEnd(' ', ','));
+            }
+
             m.Invoke(npc, args);
 
             var cfgId = BuWenFanChen.Memory.MemoryEngine.GetNpcCfgId(npc);
@@ -214,6 +280,9 @@ public static class IntimacyJudge
             Log($"[好感] 应用失败：{e.GetType().Name}: {e.Message}");
         }
     }
+
+    /// <summary>★ 2026-11-10：AddIntimacy 真实签名只打一次</summary>
+    private static bool _sigLogged;
 
     private static bool TryParseDelta(string content, out int delta)
     {

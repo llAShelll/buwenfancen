@@ -29,13 +29,13 @@ public static class LlmClient
     ///   会直接 400。这里先带 thinking 发，判断是参数问题就自动去掉重试一次。
     /// </summary>
     public static async Task<(string Content, string Error)> CompleteAsync(
-        Config cfg, string systemPrompt, string userPrompt, int maxTokens = 3000)
+        Config cfg, string systemPrompt, string userPrompt, int maxTokens = 3000, double temperature = 0.3)
     {
         if (cfg == null || !cfg.IsValid) return (null, "配置无效（缺 Url 或 ApiKey）");
 
-        var (content, err) = await SendAsync(cfg, systemPrompt, userPrompt, maxTokens, withThinking: true);
+        var (content, err) = await SendAsync(cfg, systemPrompt, userPrompt, maxTokens, withThinking: true, temperature);
         if (content == null && LooksLikeBadParam(err))
-            (content, err) = await SendAsync(cfg, systemPrompt, userPrompt, maxTokens, withThinking: false);
+            (content, err) = await SendAsync(cfg, systemPrompt, userPrompt, maxTokens, withThinking: false, temperature);
         return (content, err);
     }
 
@@ -65,7 +65,7 @@ public static class LlmClient
     }
 
     private static async Task<(string Content, string Error)> SendAsync(
-        Config cfg, string systemPrompt, string userPrompt, int maxTokens, bool withThinking)
+        Config cfg, string systemPrompt, string userPrompt, int maxTokens, bool withThinking, double temperature = 0.3)
     {
         try
         {
@@ -77,7 +77,7 @@ public static class LlmClient
                     new { role = "system", content = systemPrompt },
                     new { role = "user", content = userPrompt },
                 },
-                ["temperature"] = 0.3,
+                ["temperature"] = temperature,
                 ["max_tokens"] = maxTokens,
             };
             // 抽取/建卡要确定性结果，关思考（DeepSeek 格式；其它模型会忽略或拒收）

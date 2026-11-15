@@ -91,6 +91,31 @@ public static class PromptConfig
             : (JsonIntensifyOverride.Value ? "强制开" : "强制关");
 
     /// <summary>
+    /// 死命令示例开关（默认开）：在【系统死命令】后面追加一条**完整可抄**的 a1ttsv2 示例。
+    /// 依据：2026-11-02 离线 AB（各 12 次）——a1ttsv2 合规 6/12（50%）→ 9/12（75%）。
+    /// 关掉 = 只留现在的结构描述（老行为），做对照实验用。
+    /// </summary>
+    public static bool DeadCommandExample { get; private set; } = true;
+
+    /// <summary>
+    /// 四选一对话选项开关（2026-11-03 实验，默认开）。
+    /// 开：要求模型在 JSON 顶层多给 "opts": [4 条玩家可说的话]，
+    ///     输出侧由 OptionsProbe 摘掉（不进 content / a1ttsv2 / 历史），只记日志 + 落盘。
+    /// 关：完全回到老行为（prompt 里不出现选项要求）。
+    /// 用途：先验证「模型能不能稳定给 4 条好选项」，稳了再做弹窗面板。
+    /// </summary>
+    public static bool OptionsEnabled { get; private set; } = true;
+
+    /// <summary>
+    /// ★ 2026-11-04：自动好感度走「主请求」还是「独立请求」。
+    /// true（默认）= 模型在主回复 JSON 顶层给 "intimacy":{"delta":N,"reason":"…"}，
+    ///              我们从原始输出解析，省掉每轮那次 1200 输入 token 的判断请求。
+    /// false      = 回到原来的独立请求（IntimacyJudge.Judge）。
+    /// 两个开关配合：autoIntimacyEnabled 管「要不要加减」，本开关管「怎么判断」。
+    /// </summary>
+    public static bool IntimacyInMainRequest { get; private set; } = true;
+
+    /// <summary>
     /// 是否启用「从正文补造 a1ttsv2」的兜底（默认 true）。
     /// 关掉之后：模型没吐 a1ttsv2 时不做任何事，交给 TTS 自己的 recovery。
     /// 用途：验证「模型自己给的台本能否独立工作」，判断补写是帮忙还是干扰。
@@ -105,8 +130,81 @@ public static class PromptConfig
     /// 回复字数上限（玩家可在 config.json 里改）。
     /// 三个数字都会被自己生成的【字数】规则段和输出侧裁段逻辑使用。
     /// </summary>
+    /// <summary>
+    /// ★ 2026-11-12 主人定：AI 回复语言（zh-CN 简中 / zh-TW 繁中 / en 英文）。
+    /// 只改「模型输出的文字语言」：游戏 UI、输入框、语音 MOD 一概不动。
+    /// 实现：tail 最末尾追加一段语言锁定（见 CompleteBudgetedPatch.BuildOutputLanguageBlock）。
+    /// 实测（2026-11-12，真实请求 req_0007）：加在 tail 末尾，4 轮中文输入也拉不回去；
+    /// 缓存只多 ~163 token 未命中。默认 zh-CN = 完全不注入，行为零变化。
+    /// </summary>
+    public static string OutputLanguage { get; private set; } = "zh-CN";
+
     /// <summary>NSFW 板块注入模式：off / auto（默认，关键词触发）/ always</summary>
     public static string NsfwMode { get; private set; } = "auto";
+
+    // ===== ★ 2026-11-12：NPC 数值面板（1.4.0）配置（施工图 §8） =====
+
+    /// <summary>面板总开关（默认 false = 完全不影响行为，tail 与 1.3.5 一致）</summary>
+    public static bool PanelEnabled { get; private set; } = true;   // ★ 2026-11-14 主人要求：性格面板默认开启
+
+    /// <summary>true = 判定搭主请求 "p" 字段（零额外调用）；false = 独立调用（预留）</summary>
+    public static bool PanelInMainRequest { get; private set; } = true;
+
+    /// <summary>NSFW 四项是否启用</summary>
+    public static bool PanelNsfw { get; private set; } = true;
+
+    /// <summary>四轴单轮上限（1~2）</summary>
+    public static int PanelStepMax { get; private set; } = 1;
+
+    /// <summary>强烈事件上限</summary>
+    public static int PanelStrongStep { get; private set; } = 2;
+
+    /// <summary>NSFW 单轮上限</summary>
+    public static int PanelNsfwStepMax { get; private set; } = 2;
+
+    /// <summary>死区半径（范围内不注入状态句）</summary>
+    public static int PanelDeadZone { get; private set; } = 7;
+
+    /// <summary>同一轴连续变化多少轮触发冷却</summary>
+    public static int PanelCooldownStreak { get; private set; } = 3;
+
+    /// <summary>冷却停多少轮</summary>
+    public static int PanelCooldownLatch { get; private set; } = 2;
+
+    /// <summary>四轴衰减周期（按总轮数），0 = 不衰减</summary>
+    public static int PanelDecayEvery { get; private set; } = 8;
+
+    /// <summary>NSFW 四项按「空闲轮数」衰减（§3.2.1 铁规一）；false = NSFW 永不衰减</summary>
+    public static bool PanelNsfwDecayIdle { get; private set; } = true;
+
+    /// <summary>点「按角色卡重新推断」前二次确认（预留 P1）</summary>
+    public static bool PanelInitConfirm { get; private set; } = true;
+
+    /// <summary>growth 养成模式（面板 &gt; NSFW 模块）/ allopen 我全都要（NSFW 模块 &gt; 面板）</summary>
+    public static string PanelNsfwMode { get; private set; } = "growth";
+
+    /// <summary>控制台「手动改数值（作弊）」折叠区默认展开（预留 P1）</summary>
+    public static bool PanelCheatEdit { get; private set; } = false;
+
+    /// <summary>状态块字数硬上限</summary>
+    public static int PanelInjectMaxChars { get; private set; } = 120;
+
+    /// <summary>玩法授权按开放度档位渐进（默认关 = 保持一刀切全开；P2 才用）</summary>
+    public static bool NsfwPanelGating { get; private set; } = false;
+
+    /// <summary>面板初始位置（屏幕比例，P1 用）</summary>
+    public static double PanelBtnX { get; private set; } = 0.66;
+    public static double PanelBtnY { get; private set; } = 0.80;
+
+    /// <summary>★ 2026-11-13：性格面板缩放（0.5~1.5，100% = 原始大小；玩家拖动后持久化到 config.json）</summary>
+    public static float PanelScale { get; private set; } = 1.0f;
+
+    /// <summary>★ 2026-11-13 主人要：选项框拖动偏移（相对自动定位位置；拖动后持久化，重启保留）</summary>
+    public static float OptionsOffsetX { get; private set; } = 0f;
+    public static float OptionsOffsetY { get; private set; } = 0f;
+
+    /// <summary>★ 2026-11-13：允许男性角色也使用性格面板（默认关；关时男性 NPC 不显示面板）</summary>
+    public static bool PanelForMale { get; private set; } = false;
 
     /// <summary>命中后持续注入的轮数</summary>
     public static int NsfwLatch { get; private set; } = 5;
@@ -120,6 +218,60 @@ public static class PromptConfig
     /// 依据：玩家一小时大约和同一个 NPC 聊 40 轮，30 轮 ≈ 一小时抽一次，合理。
     /// </summary>
     public static int ExtractInterval { get; private set; } = 30;
+
+    /// <summary>
+    /// ★ 2026-11-07 主人定：canon 保留轮数（档位）。
+    ///
+    /// 影响：保留越多 → prompt 越长 → 模型越容易忘格式（实测长度与失败率强正相关）、
+    ///       命中率/成本也越差；保留越少 → 原文窗口窄，但记忆本体（facts/摘要/骨架）不受影响。
+    /// 实际行为：归档触发点 = CanonKeepRounds + 10（ArchiveEvery），裁到 CanonKeepRounds。
+    ///   10 → 波动 10~20 轮（平均 15）
+    ///   15 → 波动 15~25 轮（平均 20）
+    ///   20 → 波动 20~30 轮（平均 25，旧默认）
+    /// 默认 10：配合 prompt 缩短，优先降失败率和成本。
+    /// </summary>
+    public static int CanonKeepRounds { get; private set; } = 10;
+
+    /// <summary>
+    /// ★ 2026-11-07 主人定：归档/合并轮次（canon 涨到 Keep+ArchiveEvery 时触发一次，
+    /// 一次裁掉 ArchiveEvery 轮，同时把裁掉的轮次异步合并进长期记忆）。
+    ///
+    /// 与 CanonKeepRounds 一起构成四档（上限 = 保留 + 合并 - 1，始终大于保留轮数，不会退化成滑动窗口）：
+    ///   MAX  = 8/4  → 波动 8~11 轮，体验最好、合并最勤、缓存断点最多
+    ///   High = 10/6 → 波动 10~15 轮（默认）
+    ///   Low  = 15/8 → 波动 15~22 轮
+    ///   Off  = 20/10→ 波动 20~29 轮，最省、格式失败率最高
+    ///
+    /// 实测依据（576 次重放）：格式失败率由 prompt 长度主导，与档位无独立关系。
+    /// 约束：必须 ≥ 2 —— 再小就退化成「每轮都裁」的滑动窗口，缓存会崩。
+    /// </summary>
+    public static int CanonArchiveEvery { get; private set; } = 6;
+
+    /// <summary>
+    /// ★ 2026-11-07 主人定：**记忆合并节拍**（每 N 轮把积压的归档内容一次性整合进长期记忆）。
+    /// 与「裁剪节拍（CanonArchiveEvery）」解耦：
+    ///   · 裁剪可以勤 → canon 窗口始终短 → 遵循率高、峰值低（但每次裁剪会断一次缓存，从 history 开头）
+    ///   · 合并可以稀 → LLM 调用少 + 记忆区（s0 里的长期记忆段）断点少（记忆更新断在 s0，比裁剪更靠前、更贵）
+    /// 四档：MAX 8 / High 24 / Low 36 / Off 48 —— 每 1~5 次裁剪才合并一次，
+    /// 合并时把 archive_pending.jsonl 里积压的全部内容压成多代总述（每 4~6 轮一代）。
+    /// MAX 档的定位是「记忆最新鲜」（8 轮就合并一次），不是「失败率最低」——
+    /// 实测加了 14 字格式指令后，High/Low 的掉 JSON 率（2.1%/3.1%）并不比 MAX（3.1%）差。
+    /// </summary>
+    public static int CanonMergeEvery { get; private set; } = 24;
+
+    // ============ ★ 2026-11-07：玩家主角设定（覆盖/新增游戏原文里的「## 当前场景 → 对话对象」）============
+    // 空字符串 = 不覆盖，用游戏原文。填了就替换对应项。
+    // 「对话对象」在 context（messages[1]）里，注入走 CompleteBudgetedPatch.InjectPlayerProfile。
+    public static string PlayerName { get; private set; } = "";
+    public static string PlayerGender { get; private set; } = "";
+    public static string PlayerRealm { get; private set; } = "";
+    public static string PlayerSect { get; private set; } = "";
+
+    /// <summary>
+    /// 自定义条目（原文没有的键）。一行一条，格式 `键：值`。
+    /// 例：`灵根：火单` / `出身：山下药铺的儿子`。同名键会覆盖原文，新键追加到列表末尾。
+    /// </summary>
+    public static string PlayerExtra { get; private set; } = "";
 
     /// <summary>代演在场角色（阶段 5 功能，字段先留）</summary>
     public static bool AllowNpcActing { get; private set; } = false;
@@ -198,6 +350,12 @@ public static class PromptConfig
     public static bool NsfwEnabled { get; private set; } = true;
 
     /// <summary>
+    /// ★ 2026-11-09：**过审模式**——隐藏所有 NSFW 内容（控制台 NSFW 页、角色卡 NSFW 区、提示词 NSFW 注入）。
+    ///   教学视频 / 直播录屏用，默认 false，正常玩家完全不受影响。config: hideNsfw
+    /// </summary>
+    public static bool HideNsfw { get; private set; } = false;
+
+    /// <summary>
     /// 角色卡专用模型（空 = 跟游戏对话用同一个模型）。
     /// 1.1.2 有独立配置；想用更强的模型生成角色卡时填，例如 deepseek-v4-pro。
     /// </summary>
@@ -253,23 +411,8 @@ public static class PromptConfig
     /// <summary>裁剪硬阈值倍数（超上限 × 这个倍数才真删，平时只警告）</summary>
     public static double ReplyLenHardRatio { get; private set; } = 2.0;
 
-    public static bool FallbackEnabled { get; private set; } = false;
-
-    /// <summary>
-    /// 兜底是否【每轮都补】（默认 false）。
-    ///   fallbackEnabled=false                  → 永不补写
-    ///   fallbackEnabled=true + 本项 false       → 只在该 NPC 第 1 轮补（默认，推荐）
-    ///   fallbackEnabled=true + 本项 true        → 每轮都补
-    ///
-    /// 什么时候该开本项：等 Havoc 说明 display_spoken_content_changed 的判定规则、
-    /// 我们把补造的 segments 调到和 content 严格对齐之后 —— 那时补写不再破坏 recovery，
-    /// 每轮都补反而更安全。
-    /// </summary>
-    public static bool FallbackAlways { get; private set; } = false;
-
-    /// <summary>兜底当前状态的可读描述（日志/控制台用）。</summary>
-    public static string FallbackDesc =>
-        !FallbackEnabled ? "关" : (FallbackAlways ? "开→每轮都补" : "开→仅第一轮");
+    // ★ 2026-11-07 主人要求：补写语音台本整套功能已删除
+    //   （FallbackEnabled / FallbackAlways / ScriptRepairEnabled / FallbackDesc 全部移除）
 
     /// <summary>加载摘要（给启动日志用）</summary>
     public static string Summary { get; private set; } = "";
@@ -362,12 +505,21 @@ public static class PromptConfig
                     {
                         try { JsonIntensifyOverride = ji.GetValue<bool>(); } catch { }
                     }
-                    // ★ 2026-10-26：补写【强制关闭】，不再读 config 里的值。
-                    //   原因（主人定）：补写会往输出/历史里塞我们生成的台本，
-                    //   模型跟着学坏，越来越不吐 a1ttsv2 —— 这是模型不吐台本的主要原因。
-                    //   老玩家 config 里写着 true 也不生效，一律按关处理。
-                    FallbackEnabled = false;
-                    FallbackAlways = false;
+                    // ★ 2026-11-02：死命令示例开关（默认开；config 里 deadCommandExample=false 可关）
+                    if (o.TryGetPropertyValue("deadCommandExample", out var dce) && dce != null)
+                    {
+                        try { DeadCommandExample = dce.GetValue<bool>(); } catch { }
+                    }
+                    // ★ 2026-11-03：四选一对话选项（实验，默认开；optionsEnabled=false 可关）
+                    if (o.TryGetPropertyValue("optionsEnabled", out var oen) && oen != null)
+                    {
+                        try { OptionsEnabled = oen.GetValue<bool>(); } catch { }
+                    }
+                    // ★ 2026-11-04：自动好感度走主请求还是独立请求（默认主请求）
+                    if (o.TryGetPropertyValue("intimacyInMainRequest", out var imr) && imr != null)
+                    {
+                        try { IntimacyInMainRequest = imr.GetValue<bool>(); } catch { }
+                    }
                     // ★ 字数上限（玩家可改）
                     if (o.TryGetPropertyValue("replyLenTotal", out var rlt) && rlt != null)
                     {
@@ -394,6 +546,77 @@ public static class PromptConfig
                     {
                         try { var v = nl.GetValue<int>(); if (v > 0) NsfwLatch = v; } catch { }
                     }
+                    // ★ 2026-11-12 主人定：AI 回复语言（zh-CN / zh-TW / en）
+                    if (o.TryGetPropertyValue("outputLanguage", out var ol) && ol != null)
+                    {
+                        try
+                        {
+                            var v = (ol.GetValue<string>() ?? "").Trim();
+                            if (v == "zh-CN" || v == "zh-TW" || v == "en") OutputLanguage = v;
+                            else Log($"[配置] outputLanguage={v} 不认识（只支持 zh-CN / zh-TW / en），用默认 {OutputLanguage}");
+                        }
+                        catch { }
+                    }
+
+                    // ★ 2026-11-12：NPC 数值面板（1.4.0，施工图 §8）——全部容错读取，坏值忽略
+                    if (o.TryGetPropertyValue("panelEnabled", out var pen) && pen != null)
+                    { try { PanelEnabled = pen.GetValue<bool>(); } catch { } }
+                    if (o.TryGetPropertyValue("panelInMainRequest", out var pimr) && pimr != null)
+                    { try { PanelInMainRequest = pimr.GetValue<bool>(); } catch { } }
+                    if (o.TryGetPropertyValue("panelNsfw", out var pnsw) && pnsw != null)
+                    { try { PanelNsfw = pnsw.GetValue<bool>(); } catch { } }
+                    if (o.TryGetPropertyValue("panelStepMax", out var psm) && psm != null)
+                    { try { var v = psm.GetValue<int>(); if (v >= 1 && v <= 2) PanelStepMax = v; } catch { } }
+                    if (o.TryGetPropertyValue("panelStrongStep", out var pss) && pss != null)
+                    { try { var v = pss.GetValue<int>(); if (v >= 1 && v <= 2) PanelStrongStep = v; } catch { } }
+                    if (o.TryGetPropertyValue("panelNsfwStepMax", out var pnsm) && pnsm != null)
+                    { try { var v = pnsm.GetValue<int>(); if (v >= 1 && v <= 2) PanelNsfwStepMax = v; } catch { } }
+                    if (o.TryGetPropertyValue("panelDeadZone", out var pdz) && pdz != null)
+                    { try { var v = pdz.GetValue<int>(); if (v >= 0 && v <= 30) PanelDeadZone = v; } catch { } }
+                    if (o.TryGetPropertyValue("panelCooldownStreak", out var pcs) && pcs != null)
+                    { try { var v = pcs.GetValue<int>(); if (v >= 2 && v <= 10) PanelCooldownStreak = v; } catch { } }
+                    if (o.TryGetPropertyValue("panelCooldownLatch", out var pcl) && pcl != null)
+                    { try { var v = pcl.GetValue<int>(); if (v >= 0 && v <= 10) PanelCooldownLatch = v; } catch { } }
+                    if (o.TryGetPropertyValue("panelDecayEvery", out var pde) && pde != null)
+                    { try { var v = pde.GetValue<int>(); if (v >= 0 && v <= 100) PanelDecayEvery = v; } catch { } }
+                    if (o.TryGetPropertyValue("panelNsfwDecayIdle", out var pndi) && pndi != null)
+                    { try { PanelNsfwDecayIdle = pndi.GetValue<bool>(); } catch { } }
+                    if (o.TryGetPropertyValue("panelInitConfirm", out var pic) && pic != null)
+                    { try { PanelInitConfirm = pic.GetValue<bool>(); } catch { } }
+                    if (o.TryGetPropertyValue("panelNsfwMode", out var pnm) && pnm != null)
+                    {
+                        try
+                        {
+                            var v = (pnm.GetValue<string>() ?? "").Trim();
+                            if (v == "growth" || v == "allopen") PanelNsfwMode = v;
+                        }
+                        catch { }
+                    }
+                    if (o.TryGetPropertyValue("panelCheatEdit", out var pce) && pce != null)
+                    { try { PanelCheatEdit = pce.GetValue<bool>(); } catch { } }
+                    if (o.TryGetPropertyValue("panelInjectMaxChars", out var pimc) && pimc != null)
+                    { try { var v = pimc.GetValue<int>(); if (v >= 60 && v <= 400) PanelInjectMaxChars = v; } catch { } }
+                    if (o.TryGetPropertyValue("nsfwPanelGating", out var npg) && npg != null)
+                    { try { NsfwPanelGating = npg.GetValue<bool>(); } catch { } }
+                    if (o.TryGetPropertyValue("panelBtnX", out var pbx) && pbx != null)
+                    { try { PanelBtnX = pbx.GetValue<double>(); } catch { } }
+                    if (o.TryGetPropertyValue("panelBtnY", out var pby) && pby != null)
+                    { try { PanelBtnY = pby.GetValue<double>(); } catch { } }
+                    if (o.TryGetPropertyValue("panelScale", out var psc) && psc != null)
+                    {
+                        try
+                        {
+                            var v = psc.GetValue<float>();
+                            if (v >= 0.5f && v <= 1.5f) PanelScale = v;
+                        }
+                        catch { }
+                    }
+                    if (o.TryGetPropertyValue("panelForMale", out var pfm) && pfm != null)
+                    { try { PanelForMale = pfm.GetValue<bool>(); } catch { } }
+                    if (o.TryGetPropertyValue("optionsOffX", out var oox) && oox != null)
+                    { try { OptionsOffsetX = (float)oox.GetValue<double>(); } catch { } }
+                    if (o.TryGetPropertyValue("optionsOffY", out var ooy) && ooy != null)
+                    { try { OptionsOffsetY = (float)ooy.GetValue<double>(); } catch { } }
                     // ★ 阶段 4-A：剩余硬编码搬进 config.json
                     if (o.TryGetPropertyValue("replyLenLo", out var rllo) && rllo != null)
                     {
@@ -403,6 +626,62 @@ public static class PromptConfig
                     {
                         try { var v = ei.GetValue<int>(); if (v > 0) ExtractInterval = v; } catch { }
                     }
+                    // ★ 2026-11-07 主人定：canon 保留轮数档位（实际触发点 = 该值 + ArchiveEvery(10)）
+                    if (o.TryGetPropertyValue("canonKeepRounds", out var ckr) && ckr != null)
+                    {
+                        try
+                        {
+                            var v = ckr.GetValue<int>();
+                            if (v >= 4 && v <= 60) CanonKeepRounds = v;
+                            else Log($"[配置] canonKeepRounds={v} 超出 4~60，忽略，用默认 {CanonKeepRounds}");
+                        }
+                        catch { }
+                    }
+                    // ★ 2026-11-07 主人定：canon 归档/合并轮次（上限 = 保留 + 该值 - 1）
+                    if (o.TryGetPropertyValue("canonArchiveEvery", out var cae) && cae != null)
+                    {
+                        try
+                        {
+                            var v = cae.GetValue<int>();
+                            if (v >= 2 && v <= 30) CanonArchiveEvery = v;
+                            else Log($"[配置] canonArchiveEvery={v} 超出 2~30，忽略，用默认 {CanonArchiveEvery}");
+                        }
+                        catch { }
+                    }
+                    // 安全闸：合并轮次至少 2 —— 等于 1 就是「每轮都裁」的滑动窗口，缓存会崩
+                    if (CanonArchiveEvery < 2)
+                    {
+                        Log($"[配置] canonArchiveEvery={CanonArchiveEvery} 太小（<2），恢复到 2");
+                        CanonArchiveEvery = 2;
+                    }
+                    // ★ 2026-11-07 主人定：记忆合并节拍（跟裁剪解耦，默认 24 轮）
+                    if (o.TryGetPropertyValue("canonMergeEvery", out var cme) && cme != null)
+                    {
+                        try
+                        {
+                            var v = cme.GetValue<int>();
+                            if (v >= 2 && v <= 200) CanonMergeEvery = v;
+                            else Log($"[配置] canonMergeEvery={v} 超出 2~200，忽略，用默认 {CanonMergeEvery}");
+                        }
+                        catch { }
+                    }
+                    // 安全闸：合并节拍至少 2 —— 等于 1 就是每轮合并，等于把两个旋钮又绑回一起
+                    if (CanonMergeEvery < 2)
+                    {
+                        Log($"[配置] canonMergeEvery={CanonMergeEvery} 太小（<2），恢复到 2");
+                        CanonMergeEvery = 2;
+                    }
+                    // ★ 2026-11-07：玩家主角设定（空 = 不覆盖，用游戏原文）
+                    if (o.TryGetPropertyValue("playerName", out var pn) && pn != null)
+                    { try { PlayerName = pn.GetValue<string>() ?? ""; } catch { } }
+                    if (o.TryGetPropertyValue("playerGender", out var pg) && pg != null)
+                    { try { PlayerGender = pg.GetValue<string>() ?? ""; } catch { } }
+                    if (o.TryGetPropertyValue("playerRealm", out var pr) && pr != null)
+                    { try { PlayerRealm = pr.GetValue<string>() ?? ""; } catch { } }
+                    if (o.TryGetPropertyValue("playerSect", out var ps) && ps != null)
+                    { try { PlayerSect = ps.GetValue<string>() ?? ""; } catch { } }
+                    if (o.TryGetPropertyValue("playerExtra", out var pe) && pe != null)
+                    { try { PlayerExtra = pe.GetValue<string>() ?? ""; } catch { } }
                     if (o.TryGetPropertyValue("allowNpcActing", out var ana) && ana != null)
                     {
                         try { AllowNpcActing = ana.GetValue<bool>(); } catch { }
@@ -470,6 +749,10 @@ public static class PromptConfig
                     if (o.TryGetPropertyValue("nsfwEnabled", out var ne) && ne != null)
                     {
                         try { NsfwEnabled = ne.GetValue<bool>(); } catch { }
+                    }
+                    if (o.TryGetPropertyValue("hideNsfw", out var hn) && hn != null)
+                    {
+                        try { HideNsfw = hn.GetValue<bool>(); } catch { }
                     }
                     if (o.TryGetPropertyValue("cardModel", out var cm) && cm != null)
                     {
@@ -576,7 +859,7 @@ public static class PromptConfig
                 }
             }
 
-            Summary = $"档位 {Tier} / 来源 {source} / {Inject.Length} 字 / dump={(DumpEnabled ? $"开(留{DumpKeep})" : "关")} / 兜底={FallbackDesc} / 死命令={JsonIntensifyDesc}";
+            Summary = $"档位 {Tier} / 来源 {source} / {Inject.Length} 字 / dump={(DumpEnabled ? $"开(留{DumpKeep})" : "关")} / 死命令={JsonIntensifyDesc}" + (HideNsfw ? " / ★过审模式=开" : "");
             Log($"✓ 提示词配置已加载：{Summary}");
         }
         catch (Exception e)
@@ -623,8 +906,33 @@ public static class PromptConfig
         {
             ("dumpEnabled", JsonValue.Create(false)),
             ("dumpKeep", JsonValue.Create(200)),
-            ("fallbackEnabled", JsonValue.Create(false)),   // 2026-10-24 18:45 决定：补写默认关闭，台本交给 TTS
-            ("fallbackAlways", JsonValue.Create(false)),
+            ("deadCommandExample", JsonValue.Create(true)), // 2026-11-02：死命令后追加完整 a1ttsv2 示例（实测 50%→75%）
+            ("optionsEnabled", JsonValue.Create(true)),     // 2026-11-03：四选一对话选项（顶层 opts，输出侧摘掉）
+            ("outputLanguage", JsonValue.Create("zh-CN")),  // 2026-11-12：AI 回复语言（zh-CN / zh-TW / en）
+            // ★ 2026-11-12：NPC 数值面板（1.4.0，施工图 §8）——默认关，不影响老玩家
+            ("panelEnabled", JsonValue.Create(true)),
+            ("panelInMainRequest", JsonValue.Create(true)),
+            ("panelNsfw", JsonValue.Create(true)),
+            ("panelStepMax", JsonValue.Create(1)),
+            ("panelStrongStep", JsonValue.Create(2)),
+            ("panelNsfwStepMax", JsonValue.Create(2)),
+            ("panelDeadZone", JsonValue.Create(7)),
+            ("panelCooldownStreak", JsonValue.Create(3)),
+            ("panelCooldownLatch", JsonValue.Create(2)),
+            ("panelDecayEvery", JsonValue.Create(8)),
+            ("panelNsfwDecayIdle", JsonValue.Create(true)),
+            ("panelInitConfirm", JsonValue.Create(true)),
+            ("panelNsfwMode", JsonValue.Create("growth")),
+            ("panelCheatEdit", JsonValue.Create(false)),
+            ("panelInjectMaxChars", JsonValue.Create(120)),
+            ("nsfwPanelGating", JsonValue.Create(false)),
+            ("panelBtnX", JsonValue.Create(0.66)),
+            ("panelBtnY", JsonValue.Create(0.80)),
+            ("panelScale", JsonValue.Create(1.0)),
+            ("panelForMale", JsonValue.Create(false)),
+            ("optionsOffX", JsonValue.Create(0.0)),
+            ("optionsOffY", JsonValue.Create(0.0)),
+            ("intimacyInMainRequest", JsonValue.Create(true)), // 2026-11-04：好感度走主请求（省一次调用）
             ("cardEnabled", JsonValue.Create(true)),
             ("replaceOfficialProfile", JsonValue.Create(true)),   // 2026-10-26 主人定：默认常开（卡不齐时自动保留原文）
             ("autoIntimacyEnabled", JsonValue.Create(false)),     // 2026-10-27 自动好感度（测试功能，默认关）
@@ -640,7 +948,20 @@ public static class PromptConfig
             ("worldbookEnabled", JsonValue.Create(true)),
             ("lorebookEnabled", JsonValue.Create(true)),
             ("nsfwEnabled", JsonValue.Create(true)),
+        ("hideNsfw", JsonValue.Create(false)),   // 2026-11-09 过审模式（隐藏所有 NSFW）
             ("memoryInjectLimit", JsonValue.Create(3000)),
+            // ★ 2026-11-07 主人定：canon 保留轮数档位（触发点 = 保留 + 合并轮次）
+            ("canonKeepRounds", JsonValue.Create(10)),
+            // ★ 2026-11-07：归档/合并轮次（High 档默认 6 → 波动 10~15 轮）
+            ("canonArchiveEvery", JsonValue.Create(6)),
+            // ★ 2026-11-07：记忆合并节拍（跟裁剪解耦，High 档默认 24 轮合并一次）
+            ("canonMergeEvery", JsonValue.Create(24)),
+            // ★ 2026-11-07：玩家主角设定（空 = 用游戏原文）
+            ("playerName", JsonValue.Create("")),
+            ("playerGender", JsonValue.Create("")),
+            ("playerRealm", JsonValue.Create("")),
+            ("playerSect", JsonValue.Create("")),
+            ("playerExtra", JsonValue.Create("")),
             ("memoryTier", null),   // null = 删除旧字段
         };
 
@@ -687,6 +1008,66 @@ public static class PromptConfig
         {
             Log($"⚠ 写文件失败 {System.IO.Path.GetFileName(path)}：{e.GetType().Name}", true);
         }
+    }
+
+    /// <summary>★ 2026-11-13：保存面板缩放（玩家拖过滑块后重启游戏 / 换新对话都保留）</summary>
+    public static void SetPanelScale(float v)
+    {
+        v = System.Math.Clamp(v, 0.5f, 1.5f);
+        PanelScale = v;
+        try
+        {
+            if (!System.IO.File.Exists(ConfigPath)) return;
+            var raw = System.IO.File.ReadAllText(ConfigPath, Encoding.UTF8);
+            if (System.Text.Json.Nodes.JsonNode.Parse(raw) is not System.Text.Json.Nodes.JsonObject o) return;
+            o["panelScale"] = System.Text.Json.Nodes.JsonValue.Create((double)System.Math.Round(v, 3));
+            var text = o.ToJsonString(new JsonSerializerOptions
+            {
+                WriteIndented = true,
+                Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+            });
+            System.IO.File.WriteAllText(ConfigPath, text + "\n", new UTF8Encoding(false));
+        }
+        catch (Exception e)
+        {
+            Log($"⚠ 保存面板缩放失败：{e.GetType().Name}", true);
+        }
+    }
+
+    /// <summary>★ 2026-11-13 主人要：保存选项框拖动偏移（相对自动定位；重启/换对话都保留）</summary>
+    public static void SetOptionsOffset(float x, float y)
+    {
+        x = (float)System.Math.Round(x, 1);
+        y = (float)System.Math.Round(y, 1);
+        if (System.Math.Abs(x - OptionsOffsetX) < 0.5f && System.Math.Abs(y - OptionsOffsetY) < 0.5f) return;
+        OptionsOffsetX = x;
+        OptionsOffsetY = y;
+        try
+        {
+            if (!System.IO.File.Exists(ConfigPath)) return;
+            var raw = System.IO.File.ReadAllText(ConfigPath, Encoding.UTF8);
+            if (System.Text.Json.Nodes.JsonNode.Parse(raw) is not System.Text.Json.Nodes.JsonObject o) return;
+            o["optionsOffX"] = System.Text.Json.Nodes.JsonValue.Create((double)x);
+            o["optionsOffY"] = System.Text.Json.Nodes.JsonValue.Create((double)y);
+            var text = o.ToJsonString(new JsonSerializerOptions
+            {
+                WriteIndented = true,
+                Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+            });
+            System.IO.File.WriteAllText(ConfigPath, text + "\n", new UTF8Encoding(false));
+        }
+        catch (Exception e)
+        {
+            Log($"⚠ 保存选项框位置失败：{e.GetType().Name}", true);
+        }
+    }
+
+    /// <summary>★ 2026-11-13：恢复选项框自动定位（偏移清零并写盘）</summary>
+    public static void ResetOptionsOffset()
+    {
+        OptionsOffsetX = 0f;
+        OptionsOffsetY = 0f;
+        SetOptionsOffset(0f, 0f);
     }
 
     /// <summary>档位 2 的模板（给玩家拿去问本地模型）。</summary>

@@ -20,6 +20,15 @@ internal static class CompleteBudgetedPatch
     [ThreadStatic] private static string _currentNpcCfgId;
     private static string _dumpDir;
 
+    /// <summary>★ 2026-11-06：上一次显示选项框时的 NPC，用来检测换人</summary>
+    private static string _lastHudNpcId;
+
+    /// <summary>★ 2026-11-10：数据探针计数（只打前 12 次，避免刷日志）</summary>
+    private static int _chatDataProbe;
+
+    /// <summary>★ 2026-11-07：LlmCallOptions 字段诊断只打一次</summary>
+    private static bool _optionsProbed;
+
     [HarmonyPrefix]
     internal static void Prefix(
         object __instance,
@@ -28,15 +37,65 @@ internal static class CompleteBudgetedPatch
         object purpose,
         ref string prefix,
         ref string memory,
-        string context,
-        object history,
+        ref string context,
+        ref object history,
         ref string tail,
         string input,
         object options,
-        object doc)
+        object doc,
+        object[] __args)
     {
         try
         {
+            // ★ 2026-11-07 诊断（一次性）：打印 LlmCallOptions 的全部字段/属性。
+            //   目的：验证能不能设置 prefill（DeepSeek beta 的 prefix:true）。
+            //   实测 API 层支持（beta 端点），但框架层找不到 prefix 字段就被判死刑——先确证。
+            try
+            {
+                if (!_optionsProbed && options != null)
+                {
+                    _optionsProbed = true;
+                    var t = options.GetType();
+                    var sb = new System.Text.StringBuilder();
+                    sb.Append("[诊断] LlmCallOptions 类型=").Append(t.FullName).Append(" | 字段=");
+                    try
+                    {
+                        foreach (var f in t.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+                            sb.Append(f.Name).Append(":").Append(f.FieldType.Name).Append(" ");
+                    }
+                    catch { sb.Append("(反射字段失败) "); }
+                    sb.Append("| 属性=");
+                    try
+                    {
+                        foreach (var p in t.GetProperties(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+                        {
+                            if (p.GetIndexParameters().Length != 0) continue;
+                            sb.Append(p.Name).Append(" ");
+                        }
+                    }
+                    catch { sb.Append("(反射属性失败)"); }
+                    MemoryEngine.Log?.Invoke(sb.ToString(), false);
+                }
+            }
+            catch { }
+
+            // ★★★ 2026-11-06 修 BUG（第二次）：换 NPC 清空选项框必须放在 purpose 过滤【之前】。
+            //   第一次修的时候放在 ActualReply 分支里，结果：玩家切到 B 但还没说话，
+            //   没有任何 ActualReply 调用 → 清不到 → 切人瞬间还挂着上一个人的四条。
+            //   现在只要有任何一次调用经过这里（含 ReadOnly 预览等）就能清掉。
+            try
+            {
+                var probeCfg = Memory.MemoryEngine.GetNpcCfgId(npc);
+                if (!string.IsNullOrEmpty(probeCfg)
+                    && !string.Equals(_lastHudNpcId, probeCfg, StringComparison.Ordinal))
+                {
+                    _lastHudNpcId = probeCfg;
+                    BuWenFanChen.OptionsHud.Clear();
+                    MemoryEngine.Log?.Invoke("[选项] 换人 → 清空上轮选项框（" + probeCfg + "）", false);
+                }
+            }
+            catch { }
+
             // ★ 只处理 ActualReply（真正的玩家对话回合）
             //   Summary   = 游戏自己的摘要调用（input 是整段历史，不是玩家这句话）
             //   ReadOnly  = 只读预览
@@ -58,6 +117,110 @@ internal static class CompleteBudgetedPatch
                 //   原来是在 L84 才设，而 InjectBoundaryMarkers 在 L58 就调了
                 //   → 抓角色资料时 npcId 一直是 null → card\*.source.md 从来没生成过
                 _currentNpcCfgId = Memory.MemoryEngine.GetNpcCfgId(npc);
+
+                // ★★ 2026-11-10 探针（只读）：世界对话 vs 家园对话，是不是同一份聊天数据？
+                //   判断依据：npc 对象 HashCode / ChatMessages 列表 HashCode / 条数 / 当时是否在家园。
+                //   如果两边的 ChatMessages HashCode 相同 → 共用一份（显示层本来就通）；
+                //   不同 → 家园是独立数据，要显示层合并就得另做。
+                try
+                {
+                    if (npc != null && _chatDataProbe++ < 12)
+                    {
+                        int npcHc = 0, listHc = 0, cnt = -1;
+                        try { npcHc = npc.GetHashCode(); } catch { }
+                        try
+                        {
+                            var pi = npc.GetType().GetProperty("ChatMessages",
+                                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                            var list = pi?.GetValue(npc);
+                            if (list != null)
+                            {
+                                try { listHc = list.GetHashCode(); } catch { }
+                                try { cnt = BuWenFanChen.History.CanonStore.CountItems(list); } catch { }
+                            }
+                        }
+                        catch { }
+                        bool inHome = false;
+                        try
+                        {
+                            var ty = Il2CppInterop.Runtime.Il2CppType.Of<Game.UI.UPFLogic.NpcBedroom.NpcBedroomOverlay>();
+                            var objs = UnityEngine.Resources.FindObjectsOfTypeAll(ty);
+                            inHome = objs != null && objs.Count > 0;
+                        }
+                        catch { }
+                        MemoryEngine.Log?.Invoke(
+                            $"[探针·数据] npc={_currentNpcCfgId} 家园={inHome} npcObj=0x{npcHc:X}"
+                            + $" ChatMessages=0x{listHc:X} 条数={cnt}", false);
+                    }
+                }
+                catch { }
+
+                // ★ 2026-11-06：换人清空逻辑已提到 purpose 过滤之前（见方法开头），
+                //   这里不再重复。留个记号免得以后又加回来。
+
+                // ★★★ 2026-11-07：玩家主角设定（覆盖/新增「## 当前场景 → 对话对象」）★★★
+                //   字段在 context（messages[1]）里，原来 patch 没加 ref 改不了。
+                //   全空 = 原样返回，零风险；写回失败也只影响提示词，不崩。
+                try
+                {
+                    var newCtx = InjectPlayerProfile(context);
+                    if (!string.IsNullOrEmpty(newCtx) && newCtx != context)
+                    {
+                        context = newCtx;
+                        if (__args != null && __args.Length > 5) __args[5] = newCtx;
+                        // 回写验证：打印实际要发出去的那段开头，确认写回生效
+                        var probe = newCtx.Length > 160 ? newCtx.Substring(0, 160) : newCtx;
+                        MemoryEngine.Log?.Invoke("[玩家设定] 已注入，context 开头="
+                            + probe.Replace("\n", " "), false);
+                    }
+                }
+                catch (Exception pe)
+                {
+                    MemoryEngine.Log?.Invoke("[玩家设定] 异常：" + pe.GetType().Name + ": " + pe.Message, true);
+                }
+
+                // ★★★ 2026-11-05：history 接管（append-only canon）★★★
+                //   游戏每轮给的是滑动窗口，messages[2] 每轮都换 → 后面全部缓存未命中。
+                //   这里把它换成只增的 canon（内容全部来自游戏原对象，不新建、不改写）。
+                //   失败一律不动 __args —— 退回游戏原样，功能退化但不崩。
+                try
+                {
+                    var canonHist = BuWenFanChen.History.CanonStore.TryReplace(_currentNpcCfgId, history, out var canonNote);
+                    if (canonHist != null)
+                    {
+                        // ★★★ 2026-11-05 修 BUG：__args[6] 赋值【不生效】！
+                        //   实测：只改 __args 时，抓包看到的 history 仍是游戏的 25~29 条滑动窗口，
+                        //   根本没换成 canon。Harmony 对引用类型参数必须用 ref 回写。
+                        history = canonHist;
+                        if (__args != null && __args.Length > 6) __args[6] = canonHist;
+
+                        // ★ 诊断：赋值到底有没有写回？读回来看条数
+                        try
+                        {
+                            int nHist = BuWenFanChen.History.CanonStore.CountItems(history);
+                            int nArgs = (__args != null && __args.Length > 6)
+                                ? BuWenFanChen.History.CanonStore.CountItems(__args[6]) : -1;
+                            MemoryEngine.Log?.Invoke(
+                                $"[历史] 回写验证 history={nHist}条 args6={nArgs}条 类型={history?.GetType().Name}", false);
+                        }
+                        catch { }
+
+                        MemoryEngine.Log?.Invoke("[历史] 接管 " + canonNote, false);
+                    }
+                    else if (canonNote != null)
+                    {
+                        MemoryEngine.Log?.Invoke("[历史] 不接管：" + canonNote, false);
+                    }
+                }
+                catch (Exception e)
+                {
+                    MemoryEngine.Log?.Invoke("[历史] 接管异常 " + e.GetType().Name + ": " + e.Message, true);
+                }
+
+                // ★★ 2026-11-02 临时调试2（只读，验证完删除）★★
+                //   用 Find(key) 直接读 doc 各段（上次读 KEY_* 属性失败，换这个方法）。
+                //   删的时候：删这次调用 + 下面的 DumpDocProbe 方法 + 两个 flag 字段。
+                try { DumpDocProbe(doc); } catch { }
 
                 // ★ 2026-10-26：只读记一次 NPC 状态（好感度），供控制台显示 + 观察游戏怎么涨好感。
                 //   只读属性，零风险；失败静默。reportChange=true：和上一轮比，涨了就在日志里写一行。
@@ -81,6 +244,8 @@ internal static class CompleteBudgetedPatch
                 TryExtract(__instance, npc);
                 // ★ 回复长度 + tail REPLACE：替换游戏的长度规则和输出契约
                 var newTail = ApplyTailReplace(ApplyReplyLength(tail));
+                // ★ 2026-11-11 请求大小探针：记下这一轮各段长度（tail 的最终长度在 BuildTail 里补上）
+                try { BuWenFanChen.Diagnostics.RequestProbe.Capture(newPrefix, newMemory, context, history, input); } catch { }
                 // ★ 2026-10-24 03:35：JSON 死命令贴在 tail 末尾
                 //   依据：模拟实测（纯文本历史 50% → 死命令 75~100%）
                 //   位置理由：input 参数不是 ref 改不了，tail 是最后的 system，
@@ -96,13 +261,35 @@ internal static class CompleteBudgetedPatch
                 // ★ 2026-10-28 修 BUG：原来整个 AppendJsonDeadCommand 都包在 JsonIntensifyActive 里，
                 //   没装语音 MOD 的玩家连【最高指令/字数/角色卡/NSFW】全都不注入。
                 //   正确：这些 tail 内容无条件加；只有死命令（a1ttsv2）随语音 MOD 条件加。
+                // ★ 2026-11-04 修顺序 Bug：
+                //   原来「死命令」在 10-28 把记忆块拼进 tail 之后就被挤到中间了，
+                //   后面还跟着记忆块 + 随身之物 —— 死命令离 input 隔了 2000+ 字，威力被稀释。
+                //   实测（11-04 凌晨）：模型连 a1ttsv2 都不吐，raw 只剩 content/emotion/control。
+                //   正确顺序：游戏原文 → 记忆块 → 随身之物 → 死命令/示例/opts（紧贴 input）。
+                // 记忆块（稳定优先）先拼
+                if (!string.IsNullOrWhiteSpace(newMemory)) newTail += "\n\n" + newMemory;
+                // 随身之物挪到它前面（它每轮都变，放在死命令之前只断自己）
+                newTail = MoveTurnStateToEnd(newTail);
+                // 死命令 + 示例 + opts 放最后，紧贴玩家输入
                 var npcCfgIdForNsfw = _currentNpcCfgId ?? Memory.MemoryEngine.GetNpcCfgId(npc);
                 var npcNameForLore = Memory.MemoryEngine.GetNpcName(npc);
                 newTail = AppendJsonDeadCommand(newTail, npcCfgIdForNsfw, input, npcNameForLore);
-                // ★ 方案 A（2026-10-28）：记忆块挪到 tail 末尾（system 最后），提升缓存命中率。
-                //   依据：AB 测试（pro + flash 各 3 轮）——JSON/a1ttsv2/破甲/记忆召回全部不受影响。
-                //   收益：tail 的 5336 字从「跟着记忆一起 miss」变成「命中缓存」。
-                if (!string.IsNullOrWhiteSpace(newMemory)) newTail += "\n\n" + newMemory;
+                // ★★★ 2026-11-06 三区重排（方案 v3 §3.4）★★★
+                //   把 tail 里稳定的「角色卡 / 时间与推进 / 长期记忆」搬到 prefix（首区，缓存最稳），
+                //   把每轮变的「相关回忆 / 随身之物」压到死命令之前。
+                //   死命令 / 示例 / opts / 好感 保持在最末 —— 红线不动。
+                //   实测收益：tail 7,995→5,823 字，整体命中 88.8% → 94.5%
+                try
+                {
+                    newTail = BuWenFanChen.History.TailReorder.Run(newTail, out var reorderExtra, out var reorderNote);
+                    if (!string.IsNullOrEmpty(reorderExtra))
+                        newPrefix = newPrefix + "\r\n\r\n" + reorderExtra;
+                    MemoryEngine.Log?.Invoke("[重排] " + reorderNote, false);
+                }
+                catch (Exception re)
+                {
+                    MemoryEngine.Log?.Invoke("[重排] 异常 " + re.GetType().Name + ": " + re.Message, true);
+                }
                 // dump 传【注入后】的 tail，否则看不到死命令（2026-10-24 03:55 修）
                 DumpPrompt(npc, mode, purpose, prefix, newPrefix, memory, newMemory, context, history, newTail, input, options, doc);
                 MemoryEngine.Log?.Invoke(
@@ -117,6 +304,99 @@ internal static class CompleteBudgetedPatch
         {
             // 观察钩子绝不能影响游戏 ✗ 任何异常都吞掉
         }
+    }
+
+    // ★★ 2026-11-02 临时调试2（只读，验证完删除）★★
+    private static bool _docProbeHeaderDone;
+    private static bool _docProbeBodiesDumped;
+
+    private static void DumpDocProbe(object doc)
+    {
+        if (doc == null) return;
+        var log = BepInEx.Logging.Logger.CreateLogSource("不问凡尘");
+        try
+        {
+            var t = doc.GetType();
+            var find = t.GetMethod("Find", new[] { typeof(string) });
+            if (!_docProbeHeaderDone)
+            {
+                _docProbeHeaderDone = true;
+                log.LogInfo($"[doc2] 类型={t.FullName}");
+                var ms = t.GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+                foreach (var m in ms)
+                {
+                    var ps = m.GetParameters();
+                    var names = new System.Text.StringBuilder();
+                    for (var i = 0; i < ps.Length; i++)
+                    {
+                        if (i > 0) names.Append(',');
+                        names.Append(ps[i].ParameterType.Name);
+                    }
+                    log.LogInfo($"[doc2] 方法 {m.Name}({names})");
+                }
+            }
+            if (find == null)
+            {
+                log.LogWarning("[doc2] 没有 Find(string) 方法");
+                return;
+            }
+
+            var keys = new[] { "shared_rules", "stable_persona", "long_term_memory", "current_facts", "turn_state", "output_contract", "chat_conversation", "chat_relation_actions" };
+            var sb = new System.Text.StringBuilder("[doc2] ");
+            foreach (var k in keys)
+            {
+                try
+                {
+                    var sec = find.Invoke(doc, new object[] { k });
+                    if (sec == null) { sb.Append(k).Append("=null  "); continue; }
+                    var st = sec.GetType();
+                    var chars = st.GetProperty("Chars")?.GetValue(sec);
+                    var body = st.GetProperty("Body")?.GetValue(sec) as string ?? "";
+                    var hash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(body)));
+                    sb.Append(k).Append('=').Append(chars).Append('/').Append(hash, 0, 8).Append("  ");
+                    if (!_docProbeBodiesDumped)
+                    {
+                        var head = body.Length > 40 ? body.Substring(0, 40) : body;
+                        head = head.Replace("\r", " ").Replace("\n", " ");
+                        log.LogInfo($"[doc2] {k} chars={chars} bodyLen={body.Length} head={head}");
+                    }
+                }
+                catch (Exception e)
+                {
+                    sb.Append(k).Append("=ERR:").Append(e.GetType().Name).Append("  ");
+                }
+            }
+            _docProbeBodiesDumped = true;
+            log.LogInfo(sb.ToString());
+        }
+        catch (Exception e)
+        {
+            log.LogWarning($"[doc2] 失败：{e.GetType().Name}: {e.Message}");
+        }
+    }
+
+    /// <summary>
+    /// ★ 2026-11-02：把 tail 里的「随身之物」(turn_state) 那**一行**挪到最末。
+    ///   实测（doc2 探测）：它随玩家身上物品变，一变就把后面约 5.4K 字全拖成缓存 miss。
+    ///   只剪「**随身之物**」→「**心意赠予**」之间这一段（约 60 字）；
+    ///   后面那两段（心意赠予 / 本轮回馈方式）是稳定指令，留在原位不动。
+    /// </summary>
+    private static string MoveTurnStateToEnd(string tail)
+    {
+        if (string.IsNullOrEmpty(tail)) return tail;
+        try
+        {
+            var i = tail.IndexOf("**随身之物**", StringComparison.Ordinal);
+            if (i < 0) return tail;
+            var j = tail.IndexOf("**心意赠予**", i, StringComparison.Ordinal);
+            if (j <= i) j = tail.IndexOf("## 输出格式", i, StringComparison.Ordinal);
+            if (j <= i) return tail;
+            var moved = tail.Substring(i, j - i).Trim();
+            if (moved.Length == 0) return tail;
+            var rest = tail.Substring(0, i) + tail.Substring(j);
+            return rest.TrimEnd() + "\n\n" + moved;
+        }
+        catch { return tail; }
     }
 
     /// <summary>阶段 2 抽取：积累够 ExtractInterval 条就后台调 API 抽一次。</summary>
@@ -156,7 +436,11 @@ internal static class CompleteBudgetedPatch
             if (string.IsNullOrEmpty(cfgId)) return memory;
             var block = MemoryEngine.BuildMemoryBlock(MemoryEngine.Get(cfgId), query);
             if (string.IsNullOrEmpty(block)) return memory;
-            return string.IsNullOrEmpty(memory) ? block : memory + "\n" + block;
+            // ★ 2026-11-02 缓存优化：稳定的在前、每轮会变的在后。
+            //   block 内部 = 长期记忆（关系/总述/处境/事实，较稳）→ 相关回忆（每轮随 input 变）；
+            //   游戏原文「过往要事」含赠物/切磋计数，每轮可能变 → 放到整块最末，
+            //   这样它一变只会 miss 它自己，不会把前面 1.2K 稳定记忆一起拖下水。
+            return string.IsNullOrEmpty(memory) ? block : block + "\n" + memory;
         }
         catch
         {
@@ -189,8 +473,11 @@ internal static class CompleteBudgetedPatch
 （我抬手把茶盏推过去，垂眸看他一眼）
 “这话你问了第三回了。”
 短回复只写一行或两行同样合规，不必凑行数，也不必为了凑满而加旁白。
+旁白（）与台词“”必须分行：每段（）独占一行、每句“”独占一行，最后一段也一样，禁止把（）和“”写在同一行。
 
 【禁 meta】不得出现任何解释、警告、免责声明或道歉（如"作为AI""我只是个语言模型"）。情绪不改变字数，按性格自然写。
+
+【不记账】不要用"我记下了/记账/这笔账我记着/这本账"这类话说自己记住了。记住是心里的事，嘴上给一句反应或一个动作，不报账。
 
 【问句】默认不提问。绝大多数回复用陈述句、动作或场景收尾，把话头留在半空让玩家自己接。只有三种情况才问：玩家反问你、需要确认才答得下去；剧情到了必须由他做选择的岔路；他的话有歧义，不问就接不下去。以下一律不问：上一轮你刚问过（禁止连续两轮以问句收尾）、只是想顺势把话题甩回玩家、想不出说什么了、想让他多说点。不问句怎么收尾：说到一半停住、把一个动作做完、陈述一个判断、描述一个细节、看他一眼不说话。
 
@@ -387,9 +674,222 @@ internal static class CompleteBudgetedPatch
         "a1ttsv2 结构：{\"instruct\":\"整体演绎说明\",\"segments\":[{\"text\":\"说出口的台词\",\"tag\":\"简短语气\"}]}。" +
         "哪怕只说一句也必须有 a1ttsv2。segments 的 text 只放台词，禁止括号旁白（旁白写进 content）。" +
         "tag 用简短词，如：轻笑、叹气、气声耳语、压低声音。" +
+        // ★ 2026-11-06 回滚：主人实测精简后掉了 2~3 次语音和选项（a1ttsv2 格式不稳），
+        //   恢复完整转义规则。这条别动。
         "★ 字符串值（content、instruct、segments[].text）里【需要换行时】必须写成 \\n（不能直接敲真实换行），" +
         "双引号写 \\\"、反斜杠写 \\\\；旁白行与台词行之间必须有换行。" +
+        // ★ 2026-11-07 04:30 回滚（主人要求）：今晚往死命令里加的两句已撤——
+        //   ①「中文标点不要写 \uXXXX」②「动作/亲密也必须包 JSON」。
+        //   实测都没降失败率（34 轮掉 6 次 = 17.6%，与之前无差异），只增加 prompt 长度。
+        "★ segments 的 text 里【禁止再出现英文双引号】，要引用就用『』—— 多一个 \\\" 会把整条 JSON 截断。" +
         "★ 上文的回复格式不代表本轮格式：无论上文是纯文本还是 JSON，本轮一律按上述 JSON 结构输出。";
+
+    /// <summary>
+    /// ★ 2026-11-02：死命令后面追加的**完整示例**（模型可以照着抄结构）。
+    /// 依据：离线 AB 各 12 次（同一份真实 dump prompt，历史里不带 a1ttsv2）——
+    ///   不加示例 a1ttsv2 合规 6/12（50%），加了 9/12（75%）；JSON 合规都 ≥11/12。
+    /// 开关：config.json → deadCommandExample（默认 true，关掉=老行为）。
+    /// </summary>
+    private const string JsonDeadCommandExample =
+        "\n\n【输出示例（照着这个格式写，字段一个都不能少）】" +
+        "{\"content\":\"（她抬眼看你，指尖停在杯沿，没接话）\\n“这话你问了第三回了。”\\n（顿了顿，声音低下去）“你要真想知道，就别光问。”\"," +
+        "\"emotion\":\"doubt\",\"control\":\"none\"," +
+        "\"observe\":{\"topic_goal_met\":false,\"off_topic\":false,\"player_abandoned\":false}," +
+        "\"intent\":{\"give_gift\":false,\"gift_item\":\"none\"}," +
+        "\"a1ttsv2\":{\"instruct\":\"语气微沉，带一点被说中的不快，语速偏慢。\"," +
+        "\"segments\":[{\"text\":\"这话你问了第三回了。\",\"tag\":\"轻哼\"},{\"text\":\"你要真想知道，就别光问。\",\"tag\":\"压低声音\"}]}," +
+        "\"opts\":[\"我陪你坐会儿\",\"你这么一说，我倒是有点心疼\",\"你那天说的还算数吗\",\"要不我们去后山看看\"]}\n" +
+        "★ 上面这一条就是完整回复：content 里用（）写旁白、用“”写台词；a1ttsv2.instruct 一句语气说明；" +
+        "segments 只放台词，一句一段，tag 用“轻笑/叹气/压低声音”这种短词；" +
+        "opts 最后是四个选项（玩家能直接点出去的四种不同方向的话）。";
+
+    /// <summary>
+    /// ★ 2026-11-03：四选一对话选项（实验）。
+    /// 让模型在 JSON 顶层多给 "opts": [4 条玩家可说的话]。
+    /// 输出侧由 OptionsProbe 摘掉，不进 content / a1ttsv2 / 历史 —— 游戏和语音都察觉不到。
+    ///
+    /// 为什么放顶层而不是 content：
+    ///   ① content 有字数上限，4 条选项会挤掉台词，还可能被裁段逻辑切掉；
+    ///   ② 一旦裁段，a1ttsv2 要重建，选项就和台本对不上；
+    ///   ③ 放进 content 有被念出来的风险（TTS 只读 segments，但没法保证模型不往里写）。
+    ///
+    /// 四条换方向 + 禁收尾句，是照主人「不能全是结束场景的选项」定的。
+    /// </summary>
+    private const string JsonOptionsBlock =
+        "\n\n【四个对话选项】在 JSON 顶层、与 content 并列加一个 \"opts\" 数组，恰好 4 条，" +
+        "\"opts\":[\"…\",\"…\",\"…\",\"…\"]。" +
+        "这是给玩家点的下一步选择：每条 8-40 字，必须是【玩家角色】本人要说出口的一句话——" +
+        "不是她的台词、不是旁白、不是第三人称，也不要写成她在向你提问；" +
+        "口气要和玩家最近几轮一致（称呼、语气、用词），像玩家自己会说出来的话；" +
+        "能直接发出去，不加引号、不加序号。" +
+        "★ 选项的「温度」必须跟当前这一幕一致（照着上面已有的内容判断，不要自己加码也不要降温）：" +
+        "日常/正事 → 给具体的话题、动作、试探，别四条都是干巴巴的问答；" +
+        "暧昧（话里有钩子、离得近）→ 给能再近一步的、话里带钩的；" +
+        "亲密（已经在情事里）→ 给能延续的：能挑动她的话、能接下去的动作（动作写进（）里），" +
+        "不要出现「夜深了」「该歇了」「那我先走」这种降温或散场的话，也不要只给客套对话。" +
+        "四条别全堆一个方向：推进、回应、试探、再往前一步，挑着给。" +
+        "禁止四条都是收尾话；除非她明确赶人，否则至少 3 条要能把话或事接下去。" +
+        "opts 里跳时间的选项最多 1 条，且只在场景本身有等待意味时才给。" +
+        "opts 是新增字段，原有字段一个都不能少；也绝不要写进 content，更不要写进 a1ttsv2 的 segments。";
+
+    /// <summary>
+    /// 选项规则（动态版）：基础规则 + 亲密场景的强化要求。
+    /// ★ 2026-11-04 主人反馈：NSFW 场景里给的选项太温、像在散场。
+    ///   所以在 NSFW 锁存期间额外压一句「至少 3 条留在场内且带亲密意味」。
+    /// </summary>
+    private static string BuildOptionsBlock(bool nsfw)
+    {
+        if (!nsfw) return JsonOptionsBlock;
+        return JsonOptionsBlock +
+            "\n★ 本场景已进入亲密状态（不是刚认识、也不是在谈正事）：" +
+            "四条里【至少 3 条】必须留在场内、并且带亲密意味——可以是挑动她的话、也可以是（动作）继续下去；" +
+            "只剩 1 条可以是温和收势的，但不许出现离场、告辞、换地方这类直接散场的选项。";
+    }
+
+    /// <summary>
+    /// ★ 2026-11-04 主人定：时间与场景只能由「玩家」或本局场景推进，模型不许自己跳。
+    /// 案例：她说了「等晚上我娘回来」，聊两句模型自己写「夜气起来了」，直接把时间推过去了。
+    /// 放位置：角色卡之后、死命令之前 —— 内容规则跟内容走，输出格式留最后。
+    /// 强度：中等档（列禁词 + 给「等待」的正确演法 + 给「允许的流动」出口 + 一句口诀）。
+    /// </summary>
+    private const string TimeSceneRule =
+        "\n\n【时间与场景】" +
+        "\n- 时间和地点只能由「玩家」或本局场景推进，你不能自己宣布时间过去了、换了地方。" +
+        "\n- 禁止这类写法：「到了晚上」「天色暗了下来」「夜深了」「天亮了」「第二天」「过了几日」「转眼半月」——" +
+        "除非玩家这一轮明确说了要做（比如「等到晚上」「明天再来」「我们走」），或者场景确实已经变了。" +
+        "\n- 玩家说「等」的时候：写她现在做什么（收拾、坐着、看你、添灯），停在「等」的状态里，" +
+        "不要写等到、等来了、等到了。" +
+        "\n- 玩家说「走」的时候：可以跟着到新地点；但玩家没说来去哪，你不要替他定方向。" +
+        "\n- 允许的只有：同一场景内的自然流动（倒茶、坐下、掩窗、添灯），以及她自己的动作、神态、台词。" +
+        "\n- 一句话记住：你演的是「这一分钟的她」，不是「这一天的流水账」。";
+
+    /// <summary>
+    /// ★ 2026-11-04 主人定：回复要「大胆推进故事」，别一味客套拖延。
+    /// 与上面的时间规则不冲突：推进的是「事」（冲突/要求/转折），不是「时间地点」。
+    /// 动作写在（）里，跟台词分行。
+    /// </summary>
+    private const string PushSceneRule =
+        "\n\n【推进与动作】" +
+        "\n- 不要一味顺着、客套、拖。她可以主动做决定、提要求、换话题、靠近或退开、拒绝或答应——剧情要往前走。" +
+        "\n- 推进的是「事」，不是「时间/地点」：可以安排新的冲突、新的要求、新的转折，" +
+        "但不要替玩家跳过时段或换地方（见上一节）。" +
+        "\n- 动作、神态写成（）旁白，跟台词分行；不要用旁白代替她该说的话。" +
+        "\n- 台词要具体、有信息，别用「嗯」「好呀」「随你」这类空话占位。";
+
+    /// <summary>
+    /// ★ 2026-11-07 重写（参考《人是怎么说话的》+ dsh-fish-tone 的「压密度而非禁用」思路）：
+    ///   原来是一份 5 类具体话术的**禁用清单**——模型换个说法就绕过去了，覆盖窄。
+    ///   现在改成「四条结构硬规矩」：任何换汤不换药的套话都逃不掉；
+    ///   第 ④ 条对应 AI 偏差数据里最明显的一项（AI 输出长度全挤在均值附近，人是散开的）。
+    ///
+    /// 关键约束（主人明确）：**不是简单禁掉，而是「同一个意思换个说法」，含义不能丢。**
+    /// 位置：紧贴死命令之前（时间规则/推进规则之后）——内容规则里离生成点最近的位置。
+    /// 幂等：靠 AppendJsonDeadCommand 里的 t.Contains("【去套路】") 判断（标题保持不动，TailReorder 也靠它匹配）。
+    /// </summary>
+    private const string DeAiFlavorRule =
+        "\n\n【去套路】真人说话有七条硬规矩，每轮都照着做：" +
+        "\n① 一句只做一件事——该回答就只回答，别在同一句里又答又问又感慨；想多做一件事，换一句。" +
+        "\n② 结论说完就停——别在最后补一句解释、总结或漂亮收尾（比如「你要真想知道，就别光问」）。最像 AI 的就是这个尾巴。" +
+        "\n③ 别给对话打分，也别报账——「这句话稳」「比刚才轻」「这话接得漂亮」「我认」「我记下了」「这账我记着」这类是冒充内心戏的套话；" +
+        "真人要么直接给反应（一个动作、一句反问、沉默、岔开），要么就不说，不会评价自己的话好不好，也不会把关系当账本。" +
+        "判据：这句是在跟她说话，还是在评论「这句话」？" +
+        "\n④ 别像在答辩——被问到敏事时不要逐条澄清、别一口气把底全交、别像写申明或宣誓；" +
+        "用动作、停顿、岔开、反问、不情愿的承认来代替完整解释。承认也要带情绪，不要平静地认。" +
+        "\n⑤ 别用短句留白腔——「睡吧，我守着」「你去，我跟」「我不拦你」「你掂量」「不催你」这种不是人话，是网文腔；" +
+        "真人说得更具体、更啰嗦、更有信息，不靠短句撑气氛。" +
+        "\n⑥ 长度别匀——该一个字就一个字，该一整段就一整段；别每轮都差不多长。" +
+        "\n⑦ 台词要像真人张嘴说话——允许不完整的句子、语气词（嗯、哼、唉、罢）、停顿、重复自己、说一半改口；" +
+        "别每句都是完整主谓宾的书面句，也别每句都用一个句号收整齐。" +
+        "\n换说法的时候，**意思一点都不能丢**。判断标准：换个真人在这个场景，会不会这么说？";
+
+    /// <summary>
+    /// ★ 2026-11-07 主人定：玩家主角设定注入。
+    /// 位置：「## 当前场景」里的 **对话对象** 块（在 context / messages[1]）。
+    /// 规则：
+    ///   · 固定四项（姓名/性别/境界/宗门）有值 → 替换同名行
+    ///   · PlayerExtra 里每行 `键：值` → 同名替换、新键追加到块末尾
+    ///   · 全空 → 原样返回（零风险，一行都不动）
+    /// 为什么不做成独立 system：会多出一份和原文冲突的资料，模型要在两处之间猜；
+    /// 直接替换原文最干净，和角色卡 REPLACE 是同一个思路。
+    /// </summary>
+    private static string InjectPlayerProfile(string context)
+    {
+        if (string.IsNullOrEmpty(context)) return context;
+
+        var profile = new List<KeyValuePair<string, string>>();
+        void AddFixed(string k, string v)
+        {
+            if (!string.IsNullOrWhiteSpace(v)) profile.Add(new KeyValuePair<string, string>(k, v.Trim()));
+        }
+        AddFixed("姓名", PromptConfig.PlayerName);
+        AddFixed("性别", PromptConfig.PlayerGender);
+        AddFixed("境界", PromptConfig.PlayerRealm);
+        AddFixed("宗门", PromptConfig.PlayerSect);
+
+        foreach (var raw in (PromptConfig.PlayerExtra ?? "").Replace("\r", "").Split('\n'))
+        {
+            var line = raw.Trim();
+            if (line.Length == 0) continue;
+            var idx = line.IndexOf('：');
+            if (idx < 0) idx = line.IndexOf(':');
+            if (idx <= 0 || idx >= line.Length - 1) continue;
+            var k = line.Substring(0, idx).Trim();
+            var v = line.Substring(idx + 1).Trim();
+            if (k.Length == 0 || v.Length == 0) continue;
+            profile.RemoveAll(p => p.Key == k);       // 同键以最后一次为准
+            profile.Add(new KeyValuePair<string, string>(k, v));
+        }
+        if (profile.Count == 0) return context;
+
+        var lines = context.Replace("\r\n", "\n").Split('\n').ToList();
+
+        // 1) 找 **对话对象** 块的范围
+        int blockStart = -1, blockEnd = -1;
+        for (int i = 0; i < lines.Count; i++)
+        {
+            if (lines[i].Trim().StartsWith("**对话对象**")) { blockStart = i; break; }
+        }
+        if (blockStart < 0) return context;   // 没有这个块 → 不动
+        for (int i = blockStart + 1; i < lines.Count; i++)
+        {
+            var t = lines[i].Trim();
+            if (t.StartsWith("-")) blockEnd = i;
+            else if (t.Length == 0) continue;
+            else break;
+        }
+        if (blockEnd < 0) blockEnd = blockStart;
+
+        // 2) 替换同名键
+        var replaced = new HashSet<string>();
+        for (int i = blockStart + 1; i <= blockEnd; i++)
+        {
+            var t = lines[i].Trim();
+            if (!t.StartsWith("-")) continue;
+            var body = t.Substring(1).Trim();
+            var idx = body.IndexOf('：');
+            if (idx < 0) idx = body.IndexOf(':');
+            if (idx <= 0) continue;
+            var key = body.Substring(0, idx).Trim();
+            KeyValuePair<string, string>? hit = null;
+            foreach (var p in profile)
+                if (p.Key == key) { hit = p; break; }
+            if (hit != null)
+            {
+                lines[i] = "- " + key + "：" + hit.Value.Value;
+                replaced.Add(key);
+            }
+        }
+
+        // 3) 没匹配上的键追加到块末尾
+        var append = new List<string>();
+        foreach (var p in profile)
+            if (!replaced.Contains(p.Key)) append.Add("- " + p.Key + "：" + p.Value);
+        if (append.Count > 0) lines.InsertRange(blockEnd + 1, append);
+
+        MemoryEngine.Log?.Invoke(
+            $"[玩家设定] {profile.Count} 项：替换 {replaced.Count} 项，新增 {append.Count} 项", false);
+        return string.Join("\n", lines);
+    }
 
     /// <summary>
     /// 动态生成【字数】规则（数字来自 config.json，玩家可改）。
@@ -546,11 +1046,11 @@ internal static class CompleteBudgetedPatch
         // ★ 2026-10-27 主人定：NSFW 全局用语规范挪到【角色卡之后、死命令之前】。
         //   对齐 1.1.2：NSFW 离生成点最近，压过角色卡的口吻/绝不说，
         //   否则角色卡里的「含蓄」「绝不说露骨」会压过 NSFW，模型开始用「那里/那个地方」回避。
-        if (nsfwHit && PromptConfig.NsfwEnabled)
+        if (nsfwHit && PromptConfig.NsfwEnabled && !PromptConfig.HideNsfw)
         {
             try
             {
-                var block = NsfwConfig.BuildBlock();
+                var block = NsfwConfig.BuildBlock(npcId);   // ★ 2026-11-13 P2：养成模式按面板数值组装玩法授权段
                 if (!string.IsNullOrEmpty(block))
                 {
                     t += "\n\n" + block;
@@ -561,11 +1061,166 @@ internal static class CompleteBudgetedPatch
             catch { }
         }
 
+        // ★ 2026-11-12：NPC 数值面板（1.4.0 P0，施工图 §4.5.1）
+        //   ① 字段说明：带 ## 标题的稳定段 → TailReorder 搬进 prefix → 命中缓存
+        //   ② 状态块：每轮变 → 进 ChangeBlocks，留在 tail（本来就不命中，不该放 prefix）
+        //   面板关着（默认）时两段都不加，tail 与 1.3.5 完全一致（P0 验收 3）。
+        // ★ 2026-11-13：记录当前对话 NPC（面板按钮判断性别用；男性 NPC 不显示面板）
+        try { BuWenFanChen.Panel.PanelStore.NoteCurrentNpc(npcId); } catch { }
+
+        if (PromptConfig.PanelEnabled && !BuWenFanChen.Panel.PanelStore.ShouldHidePanel(npcId))   // ★ 2026-11-13：男性 NPC（默认）不注入面板两段
+        {
+            try
+            {
+                // ★ 2026-11-12 过审模式（hideNsfw）换用无 NSFW 版字段说明（施工图 §4.7）
+                t += BuWenFanChen.Panel.PanelRender.GetFieldBlock();
+                var pst = BuWenFanChen.Panel.PanelStore.Peek(npcId);
+                var statusBlock = BuWenFanChen.Panel.PanelRender.BuildStatusBlock(pst, nsfwHit, npcId);   // ★ 2026-11-13 传 npcId：标题带好感档位 + 好感软约束行
+                if (!string.IsNullOrEmpty(statusBlock))
+                {
+                    t += "\n\n" + statusBlock;
+                    BepInEx.Logging.Logger.CreateLogSource("不问凡尘")
+                        .LogInfo($"[面板] 注入 {statusBlock.Length} 字（{BuWenFanChen.Panel.PanelStore.ValuesText(pst)}）");
+                }
+            }
+            catch (Exception e)
+            {
+                BepInEx.Logging.Logger.CreateLogSource("不问凡尘")
+                    .LogWarning($"[面板] 注入失败：{e.GetType().Name}: {e.Message}");
+            }
+        }
+
+        // ★ 2026-11-04 主人定：时间/地点只能由玩家或场景推进，模型不许自己跳
+        //   案例：她说「等晚上我娘回来」，聊两句模型自己写「夜气起来了」。
+        //   放在角色卡之后、死命令之前：内容规则跟着内容走，输出格式留最后。
+        t += TimeSceneRule;
+        // ★ 2026-11-04 主人定：大胆推进剧情（跟时间规则不冲突——推事不推时间）
+        t += PushSceneRule;
+        // ★ 2026-11-06 主人定：去 AI 味（套路口头禅/套路应答）
+        //   要求：不是简单删掉，而是「同一个意思换个说法」，含义不能丢。
+        //   位置：紧贴死命令之前 —— 这是内容规则里离生成点最近的位置。
+        if (!t.Contains("【去套路】")) t += DeAiFlavorRule;
+
         // ★ 2026-10-28：死命令（含 a1ttsv2 台本）只在装了语音 MOD（或强制开）时才加。
         //   没装语音 MOD 时 a1ttsv2 是纯浪费（游戏不用），省约 330 字。
-        if (PromptConfig.JsonIntensifyActive) t += JsonDeadCommand;
+        if (PromptConfig.JsonIntensifyActive)
+        {
+            t += JsonDeadCommand;
+            // ★ 2026-11-02：完整示例（可抄）。离线 AB 各 12 次：a1ttsv2 合规 6/12 → 9/12。
+            if (PromptConfig.DeadCommandExample) t += JsonDeadCommandExample;
+        }
+
+        // ★ 2026-11-03：四选一对话选项（实验）。跟语音 MOD 无关，独立于上面的 JSON 强制开关。
+        //   放在 tail 最末尾：紧贴玩家输入，模型最不容易忽略。
+        if (PromptConfig.OptionsEnabled)
+        {
+            t += BuildOptionsBlock(nsfwHit);
+        }
+
+        // ★ 2026-11-04：自动好感度走主请求（省掉每轮那次独立判断请求）。
+        //   只在「自动好感度开着」且「选了主请求模式」时才要求，否则白占字数。
+        if (PromptConfig.IntimacyInMainRequest && PromptConfig.AutoIntimacyEnabled)
+        {
+            t += MainIntimacyBlock;
+        }
+
+        // ★ 2026-11-10 体检打点：tail 里「选项要求 / 好感要求」到底进没进。
+        //   这两个开关是 config 里的，玩家不会误关；但如果这段没执行，就是上游 patch 断了。
+        try
+        {
+            BuWenFanChen.Diagnostics.HealthProbe.Link("tail 注入",
+                "选项=" + (PromptConfig.OptionsEnabled ? "要求" : "关")
+                + " 好感=" + ((PromptConfig.IntimacyInMainRequest && PromptConfig.AutoIntimacyEnabled) ? "要求" : "关")
+                + " tailLen=" + (t == null ? -1 : t.Length));
+        }
+        catch { }
+
+        // ★ 2026-11-11 请求大小探针（主人要求）：这一轮最终请求有多大、占玩家上下文的百分之几。
+        //   玩家再报「上下文超出模型上限」时，日志里当场有答案，不用翻 dump 也不用抓包。
+        try { BuWenFanChen.Diagnostics.RequestProbe.Report(t == null ? -1 : t.Length); } catch { }
+
+        // ★ 2026-11-12 主人定：AI 回复语言（默认简中 = 不注入，行为零变化）。
+        //   放在 JsonOneLiner 之前：那句话必须保持「tail 最后一句」（实测铁律），
+        //   而语言段本身也紧贴末尾（离生成点最近）。
+        var langBlock = BuildOutputLanguageBlock();
+        if (!string.IsNullOrEmpty(langBlock))
+        {
+            t += langBlock;
+            try
+            {
+                BepInEx.Logging.Logger.CreateLogSource("不问凡尘")
+                    .LogInfo($"[语言] 输出语言={PromptConfig.OutputLanguage} → 追加 {langBlock.Length} 字");
+            }
+            catch { }
+        }
+
+        // ★ 2026-11-07：极简正向格式指令（挂在 tail 最末尾，紧贴玩家输入）
+        //   实测（_capture 三轮共 325 次，见 修复验证_极简格式指令_20261107.md）：
+        //     · 长独白骨架 + 承接式短问句：掉 JSON 率 60% → 24%（p=0.021）
+        //     · 短 prompt：32~36% → 8%
+        //     · 换骨架（plot / nsfw）：0% / 4%
+        //   铁律：只此一句、14 字、不加否定词、不加第二句（实测加第二句效果归零）。
+        //   反面：否定式（「不得输出小说正文」）反而把失败率推到 80%。
+        t += JsonOneLiner;
+
         return t;
     }
+
+    /// <summary>
+    /// ★ 2026-11-07：极简正向格式指令。追加在 tail 最末尾（【好感变化】之后）。
+    /// 为什么必须这么短：实测 14 字 → 失败率 0~8%；加一句「不要写超过 3 段」就回到 36%。
+    /// 为什么不写否定词：说「不得输出小说正文」等于把「小说正文」摆到模型眼前，失败率反升到 80%。
+    /// </summary>
+    private const string JsonOneLiner = "\n\n本轮输出必须是一个 JSON 对象。";
+
+    /// <summary>
+    /// ★ 2026-11-12 主人定：回复语言锁定段（默认简中 = 返回空，不注入）。
+    ///
+    /// 位置：tail 最末尾、紧贴玩家输入。实测（2026-11-12，真实请求 req_0007_193759）：
+    ///   · 英文版**必须写明 including parentheses**，否则台词英文、括号旁白中文（半洋半中）；
+    ///   · 繁中版一次通过、不混简体；a1ttsv2.tag 保持游戏词表原词（简体），这是对的；
+    ///   · 连续 4 轮中文玩家输入，输出保持 100% 英文，不漂回去；
+    ///   · 缓存代价：前缀 14,080 token 全命中，只多 ~163 token 未命中（tail 本来就不命中）。
+    /// 不碰 TTS：英文/繁体与语音 MOD 的兼容性由玩家自行承担（控制台有提示）。
+    /// </summary>
+    private const string OutputLangEn =
+        "\n\n## Output language (this turn · mandatory)\n" +
+        "Write EVERYTHING in English — including all narration, actions and inner monologue, even inside parentheses. " +
+        "Do not leave any Chinese characters in the reply: no Chinese narration, no Chinese parentheses text, no Chinese asides. " +
+        "The player's message and the whole history are Chinese; that does not matter. This turn's reply must be 100% English. " +
+        "Keep the JSON structure and field names exactly as specified; translate only, never change who the character is, and do not add explanations.";
+
+    private const string OutputLangTw =
+        "\n\n## 輸出語言（本輪 · 強制）\n" +
+        "本輪回覆請全部使用繁體中文（台灣用語），包括 content、a1ttsv2.instruct、a1ttsv2.segments[].text、opts 等每一個文字欄位。" +
+        "上文與玩家輸入是簡體字，但本輪一律改用繁體字回覆，不要混用簡體字。" +
+        "JSON 結構與欄位名保持不變；只換語言，不改角色身份，也不要加任何說明。";
+
+    private static string BuildOutputLanguageBlock()
+    {
+        try
+        {
+            if (PromptConfig.OutputLanguage == "en") return OutputLangEn;
+            if (PromptConfig.OutputLanguage == "zh-TW") return OutputLangTw;
+        }
+        catch { }
+        return "";
+    }
+
+    /// <summary>
+    /// ★ 2026-11-04：自动好感度走「主请求」时追加的字段要求。
+    /// 原来每轮要单独发一次判断请求（1200 输入 token），改成让主回复顺带给出。
+    /// 只解析、只存 pending，真正加减仍在下一轮 ApplyToGame（逻辑没变）。
+    /// </summary>
+    private const string MainIntimacyBlock =
+        "\n\n【好感变化】在 JSON 顶层再加一个 \"intimacy\" 对象：{\"delta\":0,\"reason\":\"一句话\"}。" +
+        "delta 是这一轮玩家言行让她好感/亲密的变化，取 -3 到 3 的整数：" +
+        "-1~-3 = 冒犯、轻慢、欺骗、无视她的感受；" +
+        "0 = 平常，没有明显变化（大多数轮次都该是 0）；" +
+        "+1~+2 = 真诚关心、体贴、说到她心里、送她喜欢的东西；" +
+        "+3 = 她明确被打动（少用）。" +
+        "只有真的发生才给非 0，别每轮都加。reason 控制在 20 字内，说明为什么。" +
+        "这是新增字段，原有字段一个都不能少。";
 
     private static string InjectBoundaryMarkers(string p)
     {
@@ -909,6 +1564,61 @@ internal static class CompleteBudgetedPatch
     }
 
     /// <summary>
+    /// ★ 2026-11-13 主人要：**聊了再生成**——没聊天不进角色页面就生成卡/世界书/记忆，会刷出一堆空卡空记忆。
+    /// 判据：该 NPC 有没有真实对话记录（memory\&lt;id&gt;\chunks.jsonl 里至少 1 条 Dialog）。
+    /// </summary>
+    internal static bool HasChatHistory(string npcId)
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(npcId)) return false;
+            var mem = Memory.MemoryStore.Load(npcId);
+            if (mem?.Chunks == null) return false;
+            return mem.Chunks.Exists(c => c.Kind == Memory.ChunkKind.Dialog);
+        }
+        catch { return false; }
+    }
+
+    /// <summary>
+    /// ★ 2026-11-13 懒生成入口：每轮收到回复、对话已写入记忆后调用。
+    /// 只在该 NPC 第一次「聊过」时触发一次（抓关系 → 生成角色卡 + 角色世界书）。
+    /// </summary>
+    private static readonly HashSet<string> _lazyGenDone = new();
+    internal static void EnsureLazyGen(object npc)
+    {
+        try
+        {
+            var npcId = Memory.MemoryEngine.GetNpcCfgId(npc);
+            if (string.IsNullOrEmpty(npcId)) return;
+            lock (_lazyGenDone) { if (_lazyGenDone.Contains(npcId)) return; }
+            if (!HasChatHistory(npcId)) return;
+            lock (_lazyGenDone) _lazyGenDone.Add(npcId);
+            CaptureRelations(npc);
+        }
+        catch { }
+    }
+
+    /// <summary>
+    /// ★ 2026-11-13：从 NPC 对象读「游戏已过年数」（GameWorld.CurrentGameTime.ElapsedYears）。
+    /// 用途：配置表 Age 是开局年龄，角色会随世界时间长大（纪澜之 130 → 10 年后 140）。
+    /// 返回 -1 表示读不到。
+    /// </summary>
+    internal static int ReadElapsedYears(object npc)
+    {
+        try
+        {
+            var gw = GetProp(npc, "GameWorld");
+            if (gw == null) return -1;
+            var gt = GetProp(gw, "CurrentGameTime");
+            if (gt == null) return -1;
+            var ey = GetProp(gt, "ElapsedYears");
+            if (ey == null) return -1;
+            return Convert.ToInt32(ey.ToString());
+        }
+        catch { return -1; }
+    }
+
+    /// <summary>
     /// 抓关系网 + 存 + 首次生成角色世界书（一个调用搞定，供 StartFreeChatAsync 用）。
     /// </summary>
         internal static void CaptureRelations(object npc)
@@ -963,18 +1673,39 @@ internal static class CompleteBudgetedPatch
 
             var items = CollectRelations(npc);
 
+            // ★ 2026-11-13：先读「游戏已过年数」，年龄 = 配置表初始 Age + 已过年数
+            //   （配置表 Age 是开局年龄，不随游戏时间变；游戏 UI 显示的是加上年数后的年龄）
+            try
+            {
+                var ey = ReadElapsedYears(npc);
+                if (ey >= 0)
+                {
+                    Memory.ConfigTable.SetElapsedYears(ey);
+                    try
+                    {
+                        var gt = GetProp(GetProp(npc, "GameWorld"), "CurrentGameTime");
+                        var yearNow = GetProp(gt, "Year");
+                        BepInEx.Logging.Logger.CreateLogSource("不问凡尘")
+                            .LogInfo($"[角色世界书] 游戏时间：Year={yearNow} ElapsedYears={ey}");
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+
             if (items.Count > 0)
             {
                 Memory.RelationStore.Save(npcId, items);
-                // ★ ⑥ 把「角色自己」的年龄 + 背景也写进角色世界书
-                var selfAge = Memory.ConfigTable.GetAge(npcId);
+                // ★ ⑥ 把「角色自己」的年龄 + 背景也写进角色世界书（年龄用动态值）
+                var selfAge = Memory.ConfigTable.GetCurrentAge(npcId);
                 var selfBg = Memory.ConfigTable.GetBackground(npcId);
                 BepInEx.Logging.Logger.CreateLogSource("不问凡尘")
                     .LogInfo($"[角色世界书] 自己：age={selfAge} bgLen={(selfBg?.Length ?? 0)}");
                 // 顺手缓存，供控制台「补齐世界书」在非主线程用
                 Memory.ConfigTable.CacheProfile(npcId, selfAge, selfBg);
                 Memory.ConfigTable.SaveProfileCache();
-                if (Memory.RelationStore.WriteLorebookIfAbsent(npcId, npcName, selfAge: selfAge, selfBackground: selfBg))
+                // ★ 2026-11-13 懒生成：没聊过的角色不写世界书（避免进页面就刷出一堆空世界书）
+                if (HasChatHistory(npcId) && Memory.RelationStore.WriteLorebookIfAbsent(npcId, npcName, selfAge: selfAge, selfBackground: selfBg))
                 {
                     BepInEx.Logging.Logger.CreateLogSource("不问凡尘")
                         .LogInfo($"[角色世界书] 首次生成（npc={npcId} name={npcName} {items.Count} 条关系 + 自己）");
@@ -982,9 +1713,14 @@ internal static class CompleteBudgetedPatch
             }
 
             // ★ 2026-10-25 主人要：跑对话时自动生成角色卡（对齐 1.1.2 的行为）
-            //   条件：这个角色【还没有角色卡】+ 已经抓到资料
+            //   条件：这个角色【还没有角色卡】+ 已经抓到资料 + ★ 2026-11-13：真的聊过
             //   用【独立的一次 API 请求】，绝不和对话请求混在一起
-            TryAutoGenCard(npcId, npcName);
+            if (HasChatHistory(npcId)) TryAutoGenCard(npcId, npcName);
+            else if (_cardSkipLogged.Add("nochat_" + npcId))
+            {
+                BepInEx.Logging.Logger.CreateLogSource("不问凡尘")
+                    .LogInfo($"[角色卡] 跳过自动生成：{npcName}（{npcId}）还没聊过（聊了再生成）");
+            }
 
             // ★ 把本轮缓存到的真名写盘（关系里的 NPC 名字也被 CollectRelations 缓存了）
             try { Memory.ConfigTable.SaveNameCache(); } catch { }
@@ -1045,6 +1781,7 @@ internal static class CompleteBudgetedPatch
     }
 
     private static bool _cacheFailLogged;
+    private static bool _tableProbeLogged;   // 2026-11-08: table structure probe, once only
 
     private static void CacheAllNpcNames(object npc)
     {
@@ -1059,7 +1796,11 @@ internal static class CompleteBudgetedPatch
             var table = Memory.ConfigTable.GetTable("TbNpcBaseCfg", probe, forceRetry: true);
             if (table != null)
             {
-                var dataList = GetProp(table, "DataList");
+                // ★ 2026-11-08：从 interop Game.dll 挖到真实成员名是 `_dataList`（字段），
+                //   原来只试 "DataList" 属性 → 表拿到了也读不到行。三个名字都试。
+                var dataList = GetProp(table, "DataList")
+                            ?? GetProp(table, "_dataList")
+                            ?? GetProp(table, "dataList");
                 if (dataList != null)
                 {
                     var count = 0;
@@ -1117,7 +1858,32 @@ internal static class CompleteBudgetedPatch
                         return;
                     }
                 }
-                else log.LogWarning("[改名缓存] 表没有 DataList 属性");
+                else
+                {
+                    log.LogWarning("[改名缓存] 表没有 DataList 属性");
+                    // ★ 2026-11-08 一次性诊断：把拿到的对象到底是什么打清楚
+                    //   （表拿到了却没 DataList，说明可能拿到的不是表本身）
+                    if (!_tableProbeLogged)
+                    {
+                        _tableProbeLogged = true;
+                        try
+                        {
+                            var tt = table.GetType();
+                            var sb2 = new System.Text.StringBuilder();
+                            sb2.Append("[表诊断] 类型=").Append(tt.FullName);
+                            var ps = tt.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                            sb2.Append(" | 属性(").Append(ps.Length).Append("):");
+                            var n1 = 0;
+                            foreach (var p in ps) { if (n1++ > 30) { sb2.Append("…"); break; } sb2.Append(' ').Append(p.Name); }
+                            var fs = tt.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                            sb2.Append(" | 字段(").Append(fs.Length).Append("):");
+                            var n2 = 0;
+                            foreach (var f in fs) { if (n2++ > 30) { sb2.Append("…"); break; } sb2.Append(' ').Append(f.Name); }
+                            log.LogWarning(sb2.ToString());
+                        }
+                        catch (Exception e9) { log.LogWarning("[表诊断] 失败：" + e9.Message); }
+                    }
+                }
             }
             else
             {
@@ -1179,19 +1945,63 @@ internal static class CompleteBudgetedPatch
     /// </summary>
     private static readonly HashSet<string> _cardGenInFlight = new();
 
+    private static readonly HashSet<string> _cardSkipLogged = new();
+
     private static void TryAutoGenCard(string npcId, string npcName)
     {
         try
         {
-            if (string.IsNullOrEmpty(npcId)) return;
-            if (!PromptConfig.CardEnabled) return;
+            var log = BepInEx.Logging.Logger.CreateLogSource("不问凡尘");
+
+            // ★ 2026-10-31：四个出口都加日志（每个角色只打一次，避免刷屏）
+            //   之前全是静默 return，玩家「聊过不生成卡」时日志里什么都看不到。
+            if (string.IsNullOrEmpty(npcId))
+            {
+                log.LogWarning("[角色卡] 跳过：没拿到角色 ID（GetNpcCfgId 失败）");
+                return;
+            }
+            if (!PromptConfig.CardEnabled)
+            {
+                if (_cardSkipLogged.Add("off")) log.LogWarning("[角色卡] 跳过：角色卡注入开关关着（config cardEnabled=false）");
+                return;
+            }
 
             // 已经有卡就不生成（尊重玩家手改）
-            if (Card.CardStore.Exists(npcId)) return;
+            // ★ 2026-10-31：但「空壳卡」不算有卡 —— 卡文件在、里面全是空的，
+            //   以前一直跳过 → 这张卡永远是空的（玩家反馈「聊过不生成卡」的真凶之一）。
+            if (Card.CardStore.Exists(npcId))
+            {
+                var existingCard = Card.CardStore.Load(npcId);
+                if (Card.CardStore.HasRealContent(existingCard))
+                {
+                    if (_cardSkipLogged.Add("has_" + npcId))
+                        log.LogInfo($"[角色卡] 跳过：{npcName}（{npcId}）已经有卡了（不会覆盖，改卡请去控制台）");
+                    return;
+                }
+
+                // 空壳卡：备份成 .空壳备份_时间戳，腾出位置重新生成
+                try
+                {
+                    var p0 = Card.CardStore.ResolvePath(npcId);
+                    if (p0 != null && System.IO.File.Exists(p0))
+                        System.IO.File.Move(p0, p0 + ".空壳备份_" + DateTime.Now.ToString("yyyyMMdd_HHmmss"), overwrite: true);
+                    log.LogWarning($"[角色卡] {npcName}（{npcId}）的卡是空壳（人设/口吻都没内容）→ 已备份，重新生成");
+                }
+                catch (Exception e0)
+                {
+                    log.LogWarning($"[角色卡] 空壳卡备份失败（npc={npcId}）：{e0.Message}（继续尝试生成）");
+                }
+            }
 
             // 资料还没抓到就等下一轮
             var material = Card.CardSourceStore.Load(npcId);
-            if (string.IsNullOrWhiteSpace(material)) return;
+            if (string.IsNullOrWhiteSpace(material))
+            {
+                if (_cardSkipLogged.Add("nosrc_" + npcId))
+                    log.LogWarning($"[角色卡] 跳过：{npcName}（{npcId}）还没抓到资料 —— "
+                        + $"card 目录里应存在「*-{npcId}.source.md」；没有说明游戏原文里没截到角色属性段");
+                return;
+            }
 
             lock (_cardGenInFlight)
             {
@@ -2124,8 +2934,15 @@ internal static class CompleteBudgetedPatch
     {
         try
         {
-            var p = obj?.GetType().GetProperty(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-            return p?.GetValue(obj);
+            var t = obj?.GetType();
+            if (t == null) return null;
+            const BindingFlags F = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+            var p = t.GetProperty(name, F);
+            if (p != null) return p.GetValue(obj);
+            // ★ 2026-11-08：IL2CPP 里很多成员是【字段】（如 _dataList），只查属性会漏
+            var f = t.GetField(name, F);
+            if (f != null) return f.GetValue(obj);
+            return null;
         }
         catch
         {

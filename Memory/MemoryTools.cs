@@ -113,6 +113,116 @@ public static class MemoryTools
         }
     }
 
+    // ==================== ①-B 重写事实文风（2026-11-02 主人要） ====================
+
+    private const string RewriteFactsSystem =
+        "你是记忆改写员。下面是一行一条的【已有记忆】，每行格式：编号|内容。\n" +
+        "编号以 F 开头的是「关键事实」，以 R 开头的是「关系」。\n" +
+        "请把每一条都改写成「她自己的记忆口吻」：第一人称「我」，对方称「他」。\n\n" +
+        "【必须】\n" +
+        "  · 意思、事件、承诺、条件一个都不能改，只换人称和说法\n" +
+        "  · 去掉报账腔：不要「玩家承诺 / 某角色定下 / 玩家告知 / 应下」这类词\n" +
+        "  · 不写具体名字（名字会变、会对不上），一律用「我 / 他」\n" +
+        "  · 每条不超过 60 字\n" +
+        "  · 数量和顺序不变，不许合并、不许删、不许编\n\n" +
+        "【输出格式】（严格 JSON，不要多余文字；id 原样带回来）\n" +
+        "{\"改写\":[{\"id\":\"F0\",\"text\":\"他说过不会负我。\"},{\"id\":\"R0\",\"text\":\"我与他是道侣。\"}]}";
+
+    /// <summary>把现有 facts 的 text 批量改成第一人称陈述（只改 text，等级/类别/span 不动）。</summary>
+    public static async Task<(bool Ok, string Msg)> RewriteFactsAsync(string npcCfgId)
+    {
+        if (string.IsNullOrEmpty(npcCfgId)) return (false, "缺少角色 ID");
+
+        NpcMemory mem;
+        try { mem = MemoryStore.Load(npcCfgId); }
+        catch (Exception e) { return (false, "读记忆失败：" + e.Message); }
+
+        if (mem.Facts.Count == 0 && mem.Skeleton.Relations.Count == 0)
+            return (false, "这个角色还没有关键事实/关系，不用重写");
+
+        var cfg = MemoryEngine.GetLlmConfig(null);
+        if (!cfg.IsValid) return (false, "读不到 API 配置：settings.json 的 ainpc 段缺 url 或 apiKey");
+
+        // ★ 2026-11-05：facts 和 relations 一起重写（关系以前是「玩家与XX结为道侣」这种第三人称）
+        var sb = new StringBuilder();
+        var total = mem.Facts.Count + mem.Skeleton.Relations.Count;
+        for (var i = 0; i < mem.Facts.Count; i++)
+            sb.AppendLine($"F{i}|{mem.Facts[i].Text}");
+        for (var i = 0; i < mem.Skeleton.Relations.Count; i++)
+            sb.AppendLine($"R{i}|{mem.Skeleton.Relations[i]}");
+
+        // ★ 2026-11-06 修：maxTokens 原来 4000，条数多时 JSON 会被截断 →
+        //   表现就是「Expected depth to be zero at the end of the JSON payload」。
+        //   提到 8000；万一还不够，下面的 catch 会给明确提示而不是报一堆英文。
+        var (content, err) = await LlmClient.CompleteAsync(cfg, RewriteFactsSystem, sb.ToString(), 8000);
+        if (content == null) return (false, "模型调用失败：" + err);
+
+        try
+        {
+            var start = content.IndexOf('{');
+            var end = content.LastIndexOf('}');
+            if (start < 0 || end <= start) return (false, "模型返回不是 JSON：" + Truncate(content, 120));
+            var json = content.Substring(start, end - start + 1);
+
+            using var doc = System.Text.Json.JsonDocument.Parse(json);
+            if (!doc.RootElement.TryGetProperty("改写", out var arr))
+                return (false, "模型返回缺「改写」字段：" + Truncate(content, 120));
+
+            // 先全部收进临时表：数量对不上就整批放弃，绝不写半截
+            var map = new Dictionary<string, string>();
+            foreach (var item in arr.EnumerateArray())
+            {
+                if (!item.TryGetProperty("id", out var idEl)) continue;
+                if (!item.TryGetProperty("text", out var tEl)) continue;
+                var id = (idEl.ValueKind == System.Text.Json.JsonValueKind.String
+                          ? idEl.GetString() : idEl.ToString()) ?? "";
+                id = id.Trim().ToUpperInvariant();
+                var t = (tEl.GetString() ?? "").Trim();
+                if (t.Length == 0 || t.Length > 120) continue;
+                map[id] = t;
+            }
+            if (map.Count != total)
+                return (false, $"模型返回 {map.Count} 条 / 现有 {total} 条，数量对不上，整批放弃（数据未动）");
+
+            var changed = 0;
+            foreach (var kv in map)
+            {
+                if (kv.Key.Length < 2) continue;
+                var kind = kv.Key[0];
+                if (!int.TryParse(kv.Key[1..], out var idx)) continue;
+
+                if (kind == 'F' && idx >= 0 && idx < mem.Facts.Count)
+                {
+                    if (mem.Facts[idx].Text != kv.Value) changed++;
+                    mem.Facts[idx].Text = kv.Value;   // 只改 text：等级/类别/span 全保留
+                }
+                else if (kind == 'R' && idx >= 0 && idx < mem.Skeleton.Relations.Count)
+                {
+                    if (mem.Skeleton.Relations[idx] != kv.Value) changed++;
+                    mem.Skeleton.Relations[idx] = kv.Value;
+                }
+            }
+            if (changed == 0) return (true, "记忆已经是第一人称，没改");
+
+            BackupFacts(npcCfgId);
+            MemoryStore.Save(mem);
+            MemoryEngine.InvalidateCache(npcCfgId);
+            MemoryRetriever.Invalidate(npcCfgId);
+            return (true, $"已重写 {changed} 条（事实 + 关系统一为第一人称）；等级/类别/span 都没动");
+        }
+        catch (System.Text.Json.JsonException je)
+        {
+            // ★ 2026-11-06：模型输出被截断时 JSON 不闭合，原来这里只抛一句英文，玩家看不懂。
+            return (false,
+                $"模型返回的 JSON 不完整（现有 {total} 条记忆，输出可能被截断了）。"
+                + "可以先删掉一批旧事实再重试，或者分几次改写。原始错误：" + je.Message);
+        }
+        catch (Exception e)
+        {
+            return (false, "解析或保存失败：" + e.Message);
+        }
+    }
+
     // ==================== ② 压缩摘要 ====================
 
     private const string CompressSystem = @"你是记忆摘要员。下面是一段【较早的对话原文块】。
@@ -174,8 +284,10 @@ public static class MemoryTools
         mem.Chunks = mem.Chunks.Where(c => !targetIds.Contains(c.Id)).ToList();
         foreach (var id in targetIds) mem.Vectors.Remove(id);
 
-        // ② 追加 summary（ReplaceSummaryChunks 会重写 chunks.jsonl + 落盘向量）
-        var added = MemoryStore.ReplaceSummaryChunks(mem, lines, 1500);
+        // ★ 2026-11-03：压缩结果作为【新段追加】，不再冲掉全部摘要（原来会把最近摘要一起删掉）
+        //   段号 = 被压缩那批对话的最后一轮（重压缩同一批 → 同段号 → 幂等）
+        var segTurn = targets.Count > 0 ? targets[^1].Turn : 0;
+        var added = MemoryStore.AppendSummarySegment(mem, lines, segTurn, 1500);
 
         // ③ 删掉 dialog 之后的文件要再落一次盘（ReplaceSummaryChunks 已经重写了 chunks.jsonl，
         //    但 facts/meta 没动，这里只需作废缓存）

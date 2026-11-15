@@ -9,8 +9,14 @@ namespace BuWenFanChen.Memory;
 /// </summary>
 public static class Extractor
 {
-    /// <summary>每积累多少条 dialog 抽一次（正式值 48；测试期曾临时改为 8）</summary>
-    public static int ExtractInterval => PromptConfig.ExtractInterval;   // 阶段 4-A：改读 config.json
+    /// <summary>
+    /// 每积累多少条 dialog 抽一次。
+    /// ★ 2026-11-07 主人定：**跟上下文档位走**（CanonMergeEvery：MAX 8 / High 24 / Low 36 / Off 48）。
+    ///   原来是自己一个固定值（30），和档位里的「合并节拍」概念重复、玩家不知道该怎么调；
+    ///   现在统一成「档位里的合并数字」——MAX 记忆最勤、Off 最疏，一个旋钮管完。
+    ///   config.json 里的 extractInterval 字段保留但已停用（只作历史兼容）。
+    /// </summary>
+    public static int ExtractInterval => PromptConfig.CanonMergeEvery;
 
     /// <summary>5 级事实必须命中的里程碑词</summary>
     private static readonly string[] MilestoneWords =
@@ -65,6 +71,133 @@ public static class Extractor
         });
     }
 
+    private static readonly object _mergeGate = new();
+    private static bool _mergeRunning;
+
+    /// <summary>
+    /// ★ 2026-11-07（主人定）：归档即合并。
+    /// canon 裁掉最老 N 轮时调用，把这一段压成「过往总述」的新一代（≤30 字）。
+    /// 异步执行、不阻塞本轮对话；失败只记日志——原文还在 archive_pending.jsonl + chunks.jsonl，不丢。
+    /// 同一时间只跑一个（正在跑时直接跳过这一轮归档的合并，数据不会丢，下次归档会带上相邻内容）。
+    /// </summary>
+    public static void TriggerArchiveMerge(string npcCfgId, int pendingRounds, int remainRounds)
+    {
+        if (string.IsNullOrWhiteSpace(npcCfgId) || pendingRounds <= 0) return;
+        var cfg = MemoryEngine.GetLlmConfig(null);
+        if (cfg == null || !cfg.IsValid) return;
+        var cfgCopy = new LlmClient.Config { Url = cfg.Url, ApiKey = cfg.ApiKey, Model = cfg.Model };
+
+        var path = System.IO.Path.Combine(MemoryPaths.MemDir(npcCfgId), "archive_pending.jsonl");
+        string archiveText;
+        try { archiveText = ReadPendingText(path); }
+        catch { return; }
+        if (string.IsNullOrWhiteSpace(archiveText)) return;
+        if (archiveText.Length > 24000) archiveText = archiveText.Substring(archiveText.Length - 24000);
+        var expectGen = Math.Max(1, Math.Min(4, pendingRounds / 6 + 1));
+
+        lock (_mergeGate)
+        {
+            if (_mergeRunning)
+            {
+                MemoryEngine.Log?.Invoke("[合并] 上一次归档合并还没跑完，本轮跳过", false);
+                return;
+            }
+            _mergeRunning = true;
+        }
+
+        Task.Run(async () =>
+        {
+            try
+            {
+                // ★★ 2026-11-11 修（有设计依据，不是猜）：
+                //   `设计_骨架总述分层.md` §2.3 明确规定，改后的输入是
+                //   ——「只要新对话，**不给旧总述**」。
+                //   主路径 Extract 已经按这条改了（PastSummaryInput 只取最近 30 轮原文），
+                //   但 11-07 后加的这条「归档合并」沿用了旧的「合并续写」思路，
+                //   把 RenderPastSummary() 前 600 字当输入喂给模型 →
+                //   模型看到旧事就照抄一遍进新代，实测 skeleton.txt：
+                //     |3|=|7|=|11|、|4|=|8|=|12|、|6|=|10|  ← 10 代里只有 3~4 条不同内容
+                //   现在按设计去掉旧总述，只给「刚被裁出的这段对话」。
+                var input = "【刚被裁出原文窗口的 " + pendingRounds + " 轮对话】\n" + archiveText
+                          + "\n\n请按时间顺序写这段发生了哪些事，输出 " + expectGen + " 行，每行一条事件脉络。";
+
+                var (content, err) = await LlmClient.CompleteAsync(cfgCopy, ArchiveMergeSystem, input, 600)
+                    .ConfigureAwait(false);
+                if (content == null)
+                {
+                    MemoryEngine.Log?.Invoke("[合并] 失败（pending 保留，下次再试）：" + err, true);
+                    return;
+                }
+
+                var lines = new List<string>();
+                foreach (var raw in content.Split('\n'))
+                {
+                    var t = raw.Trim().TrimStart('-', '·', '•', ' ', '\t').Trim();
+                    if (t.Length == 0) continue;
+                    if (t.Length > Skeleton.GenCharLimit) t = t.Substring(0, Skeleton.GenCharLimit);
+                    lines.Add(t);
+                    if (lines.Count >= 4) break;
+                }
+                if (lines.Count == 0) return;
+
+                var mem2 = MemoryStore.Load(npcCfgId);
+                var maxTurn = mem2.Chunks.Count > 0 ? mem2.Chunks.Max(c => c.Turn) : 0;
+                var gens = new List<int>();
+                foreach (var t in lines)
+                {
+                    var gen = mem2.Skeleton.AddPastGen(t, maxTurn, out _);
+                    if (gen != null) gens.Add(gen.Gen);
+                }
+                if (gens.Count == 0) return;
+
+                MemoryStore.Save(mem2);
+                MemoryEngine.InvalidateCache(npcCfgId);
+
+                // ★ 只有合并成功才清空 pending；失败就留着，下次连着新的一起压（数据不丢）
+                try { System.IO.File.WriteAllText(path, "", Encoding.UTF8); } catch { }
+
+                MemoryEngine.Log?.Invoke(
+                    $"[合并] 完成：{pendingRounds} 轮 → 第 {gens[0]}~{gens[gens.Count - 1]} 代总述"
+                    + $"（共 {gens.Count} 代）| 当前窗口 {remainRounds} 轮", false);
+            }
+            catch (Exception e)
+            {
+                MemoryEngine.Log?.Invoke("[合并] 异常：" + e.GetType().Name + ": " + e.Message, true);
+            }
+            finally
+            {
+                lock (_mergeGate) _mergeRunning = false;
+            }
+        });
+    }
+
+    /// <summary>读 archive_pending.jsonl 并解成可读文本（每行 role\tbase64 一条）。</summary>
+    private static string ReadPendingText(string path)
+    {
+        if (!System.IO.File.Exists(path)) return "";
+        var sb = new StringBuilder();
+        foreach (var line in System.IO.File.ReadAllLines(path, Encoding.UTF8))
+        {
+            if (string.IsNullOrWhiteSpace(line)) continue;
+            var tab = line.IndexOf('\t');
+            if (tab <= 0) continue;
+            var role = line.Substring(0, tab);
+            string text;
+            try { text = Encoding.UTF8.GetString(Convert.FromBase64String(line.Substring(tab + 1))); }
+            catch { continue; }
+            sb.Append(role == "user" ? "玩家：" : "她：").AppendLine(text);
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>归档合并用的提示词：把积压的一段压成多代 ≤30 字的事件脉络。</summary>
+    private const string ArchiveMergeSystem = """
+你是记忆压缩员。下面给你【已有的过往总述】和【刚被裁出原文窗口的一段对话】。
+请按时间顺序，把这段对话里发生的事写成若干行事件脉络，每行不超过 30 字，最多 4 行。
+只写事件来龙去脉——谁应下什么、发生了什么转折、关系怎么变。
+不要写外貌/动作/神态/心理/环境/对白原句；不要编号、不要解释，每行一条。
+""";
+
     /// <summary>
     /// 同步抽取（2026-10-27 主人要：「立即整理」按钮用）。
     /// 把当前所有未整理的对话立刻提炼成【摘要 + facts + 骨架】，等它跑完再返回。
@@ -79,10 +212,27 @@ public static class Extractor
         }
         try
         {
-            var snapshot = TakeSnapshot(mem);
             var cfgCopy = new LlmClient.Config { Url = cfg.Url, ApiKey = cfg.ApiKey, Model = cfg.Model };
+
+            // ★ 2026-11-02 主人定（乙方案）：总述为空时，**先**把整段历史压成一份笼统目录。
+            //   只在玩家点「立即整理」时发生，不自动跑、不在加载时偷拼。
+            // ★ 2026-11-07：判断改读 RenderPastSummary()（分代后的渲染值）。
+            var pastNote = "";
+            if (string.IsNullOrWhiteSpace(mem.Skeleton.RenderPastSummary()))
+            {
+                var (okPs, msgPs) = BuildPastSummaryNow(mem, cfgCopy);
+                pastNote = "；" + msgPs;
+                if (okPs) MemoryStore.Save(mem);
+            }
+
+            var snapshot = TakeSnapshot(mem);
             var result = RunAsync(snapshot, cfgCopy, (m, w) => { }).GetAwaiter().GetResult();
-            return result ? (true, "整理完成（摘要/事实/骨架已更新）") : (false, "没有新的对话可整理（都已经整理过了）");
+
+            if (result)
+                return (true, "整理完成（摘要/事实/骨架/过往总述已更新" + pastNote + "）");
+            if (!string.IsNullOrWhiteSpace(mem.Skeleton.RenderPastSummary()))
+                return (true, (pastNote.Length > 0 ? pastNote.TrimStart('；') + "；" : "") + "没有新对话要整理");
+            return (false, "没有新的对话可整理（都已经整理过了）");
         }
         catch (Exception e)
         {
@@ -111,6 +261,9 @@ public static class Extractor
             Skeleton = new Skeleton
             {
                 Relations = new List<string>(mem.Skeleton.Relations),
+                // ★ 2026-11-07：这里放**渲染后的总述**（多代拼接），提示词里显示用
+                PastSummary = mem.Skeleton.RenderPastSummary(),
+                PastGens = new List<PastGen>(mem.Skeleton.PastGens ?? new List<PastGen>()),
                 Situation = mem.Skeleton.Situation,
             },
             Chunks = new List<Chunk>(mem.Chunks),
@@ -166,6 +319,10 @@ public static class Extractor
             Aging.AgeFacts(mem, snap.NpcCfgId);
             Aging.EnforceLevel4Cap(mem, snap.NpcCfgId);
             Aging.EvictDialogChunks(mem, snap.NpcCfgId);
+            // ★ 2026-11-03：摘要句块老化（1000 条上限 / 500 轮未召回）
+            var sumEvents = Aging.EvictSummaryChunks(mem, snap.NpcCfgId);
+            if (sumEvents.Count > 0)
+                log?.Invoke($"[老化] 摘要淘汰 {sumEvents.Count} 条（上限 {Aging.SummaryChunkCap} / {Aging.SummaryIdleTurns} 轮）", false);
             MemoryStore.Save(mem);
         }
         catch { }
@@ -178,6 +335,142 @@ public static class Extractor
         return true;
     }
 
+    // ================= 过往总述（乙方案：只由「立即整理」触发） =================
+
+    /// <summary>
+    /// ★ 2026-11-07 主人定（分层代 A 方案）：不再「整段历史压成 300 字」，
+    ///   改成「只写最近 30 轮发生了什么，≤30 字」，由程序按代累积。
+    ///
+    /// 为什么改：原来把旧总述一起喂给模型让它「合并续写」，它经常只写最近的事 →
+    ///   旧事被整体覆盖（实测 100111 的早期剧情全丢，总述只剩最近几轮）。
+    /// 现在模型不用碰旧历史，只描述「这段发生了什么」，拼接/淘汰全由程序负责。
+    /// </summary>
+    private const string PastSummarySystem = """
+你是记忆记录员。下面是你和玩家【最近这一段】的对话。
+
+只写这段里【发生了什么事】——事件的起因、经过、结果。
+不超过 30 字，直接写正文，不要编号、不要标题、不要解释。
+
+【绝对不要写】
+· 外貌、动作、神态、心理、环境、服装
+· 对白的原句
+· 情绪铺陈、氛围渲染
+
+【例子】
+✔「他应下替我炼压制丹药，头一粒我先试。」
+✔「我们在客栈定下婚约，他要先办成喜事。」
+✔「养母的真面目被揭穿，我与玩家联手将她击败。」
+✘「他指尖划过我耳根，我耳根一热，声音都软了。」（带描写）
+✘「次日他备好热水，我让他搁门口自己擦。」（是细节，不是事件）
+
+只写材料里有的，不要编造。如果这段没有值得记的事，只输出空。
+""";
+
+    /// <summary>
+    /// 生成总述用的材料。
+    /// ★ 2026-11-07（分层代 A 方案）：**只取最近 30 轮原文**。
+    ///   原来给整段历史（最多 24000 字）让模型压成 300 字，它经常只写最近的事、丢旧事；
+    ///   现在模型只负责「这一段发生了什么」，旧的由程序分层累积。
+    /// </summary>
+    private static string PastSummaryInput(NpcMemory mem)
+    {
+        const int RecentRounds = 30;
+        var sb = new StringBuilder();
+        var dlg = mem.Chunks.Where(c => c.Kind == ChunkKind.Dialog)
+            .OrderBy(c => c.Turn).ThenBy(c => c.Id).ToList();
+        if (dlg.Count > 0)
+        {
+            var maxTurn = dlg[dlg.Count - 1].Turn;
+            var minTurn = maxTurn - RecentRounds;
+            var recent = dlg.Where(c => c.Turn > minTurn).ToList();
+            sb.AppendLine("## 最近 " + RecentRounds + " 轮的对话（按【第N轮】升序）");
+            foreach (var c in recent)
+            {
+                var t = (c.Text ?? "").Trim();
+                if (t.Length == 0) continue;
+                sb.AppendLine("【第" + c.Turn + "轮】" + t);
+            }
+            sb.AppendLine();
+        }
+        // ★ 2026-11-07：不再喂「近期提要」——模型只写这一段的事，旧的由程序管
+        return sb.ToString();
+    }
+
+    /// <summary>同步把整段历史压成过往总述（玩家点「立即整理」时先跑这一步）。</summary>
+    private static (bool Ok, string Msg) BuildPastSummaryNow(NpcMemory mem, LlmClient.Config cfg)
+    {
+        try
+        {
+            var input = PastSummaryInput(mem);
+            if (string.IsNullOrWhiteSpace(input)) return (false, "没有可整理的历史");
+
+            var (content, err) = LlmClient.CompleteAsync(cfg, PastSummarySystem, input, 1200)
+                .GetAwaiter().GetResult();
+            if (content == null) return (false, "总述生成失败（模型调用失败：" + err + "）");
+
+            // ★ 2026-11-07（分层代 A 方案）：不再整体替换，改成追加一代（≤30 字）
+            var rawText = content.Trim();
+            if (string.IsNullOrWhiteSpace(rawText)) return (false, "模型没返回有效总述");
+            var maxTurn = mem.Chunks.Count > 0 ? mem.Chunks.Max(c => c.Turn) : 0;
+            var gen = mem.Skeleton.AddPastGen(rawText, maxTurn, out var evicted);
+            if (gen == null) return (false, "模型没返回有效总述");
+            var msg = "已新增第 " + gen.Gen + " 代过往总述（" + gen.Text.Length + " 字）";
+            if (evicted != null) msg += "；淘汰了第 " + evicted.Gen + " 代";
+            return (true, msg);
+        }
+        catch (Exception e)
+        {
+            return (false, "总述生成失败：" + e.Message);
+        }
+    }
+
+    /// <summary>★ 2026-11-07 主人定（B 方案）：把旧格式的第 0 代总述压成 30 字，让风格跟新代统一。</summary>
+    private const string CompressLegacySystem = """
+你是记忆压缩员。下面是一段旧的记忆总述。
+请压成不超过 30 字，只保留【最重要的事件】——谁应下什么、发生了什么转折、关系怎么变。
+不要写外貌/动作/神态/心理/环境/对白原句；不要编号、不要解释，只输出压缩后的那一句。
+""";
+
+    /// <summary>
+    /// ★ 2026-11-07（B 方案）：把第 0 代（迁移来的旧总述）压成 ≤30 字。
+    /// 由控制台「压缩旧总述」按钮触发，手动一次、不自动跑。
+    /// </summary>
+    public static (bool Ok, string Msg) CompressLegacyPastGen(string npcCfgId)
+    {
+        if (string.IsNullOrEmpty(npcCfgId)) return (false, "缺少角色 ID");
+
+        NpcMemory mem;
+        try { mem = MemoryStore.Load(npcCfgId); }
+        catch (Exception e) { return (false, "读记忆失败：" + e.Message); }
+
+        if (mem.Skeleton.PastGens == null || mem.Skeleton.PastGens.Count == 0)
+            return (false, "没有总述可压（先聊几轮或点「立即整理」）");
+
+        var oldest = mem.Skeleton.PastGens[0];
+        if (oldest == null || string.IsNullOrWhiteSpace(oldest.Text))
+            return (false, "第 0 代是空的，不用压");
+        if (oldest.Text.Length <= Skeleton.GenCharLimit)
+            return (false, $"第 0 代只有 {oldest.Text.Length} 字（上限 {Skeleton.GenCharLimit}），不需要压缩");
+
+        var cfg = MemoryEngine.GetLlmConfig(null);
+        if (!cfg.IsValid) return (false, "读不到 API 配置：settings.json 的 ainpc 段缺 url 或 apiKey");
+
+        var (content, err) = LlmClient.CompleteAsync(cfg, CompressLegacySystem, oldest.Text, 200)
+            .GetAwaiter().GetResult();
+        if (content == null) return (false, "压缩失败（模型调用失败：" + err + "）");
+
+        var text = content.Trim().Replace("\r", " ").Replace("\n", " ");
+        if (text.Length == 0) return (false, "模型没返回内容");
+        if (text.Length > Skeleton.GenCharLimit) text = text.Substring(0, Skeleton.GenCharLimit);
+
+        var before = oldest.Text.Length;
+        oldest.Text = text;
+        try { MemoryStore.Save(mem); }
+        catch (Exception e) { return (false, "保存失败：" + e.Message); }
+
+        return (true, $"第 {oldest.Gen} 代已压缩：{before} 字 → {text.Length} 字「{text}」");
+    }
+
     // ================= Prompt =================
 
     private static string BuildSystemPrompt() =>
@@ -188,6 +481,7 @@ JSON 格式：
 {
   "relations": ["新增的关系条目"],
   "situation": "当前处境一句话",
+  "pastSummary": "最近这段发生了什么（事件来龙去脉，不超过 30 字，不写描写）",
   "summary": ["摘要句1", "摘要句2"],
   "facts": [
     {"category": "Gift|Promise|RelationMilestone|ImportantEvent",
@@ -199,11 +493,23 @@ JSON 格式：
 
 规则：
 - relations：只写【新增】的关系（师徒/道侣/亲友/仇敌/主仆等），已有的不要重复。没有就给 []。
+  ★ 用第一人称写，不要写成「玩家与角色为道侣」这种第三人称：
+    写成「我与他是道侣」「他认我做师父」「我欠他一条命」「他是我的恩人」。
+    不写具体名字（名字会变，也会对不上），一律用「我 / 他」。
 - ★ relations 与 facts 互斥：关系本身（谁是谁的师徒/道侣/亲友）只写进 relations，
   不要再把「玩家与角色为道侣/夫妻」「玩家为角色徒弟」这类关系事实写进 facts。
   facts 只写「关系之外」的里程碑（承诺、生死相托、名分之外的转折、影响关系走向的具体事件）。
 - situation：当前处境一句话，会替换旧值。没有明显变化就给 ""。
+- pastSummary：**最近这段对话发生了什么**（会作为「一代」存进骨架，程序负责拼接和淘汰旧代，不用你操心）。要求：
+    · **只写这一段新发生的事**：事件的起因、经过、结果；不要重述旧历史；
+    · **不超过 30 字**（硬上限，超了会被截断）；
+    · 用她自己的视角与口吻写（第一人称「我」，对方「他/你」），不要用「玩家/角色」的第三人称报账说法；
+    · 只写「发生了什么、结果如何、关系或约定有什么变化」；
+      **绝对不写外貌/动作/神态/心理/环境/服装/对白原句/情绪铺陈**；情事只写结果（谁应下、谁定规矩、谁要什么），不写过程；
+    · 直接写正文，不要分行、不要编号、不要解释；
+    · 这段没有值得记的事就给 ""。
 - summary：3~8 句，按时间顺序，每句一个完整事件，总字数不超过 500。没有就给 []。
+    用她自己的视角与口吻（我 / 他），不要用「玩家/角色」这类第三人称报账说法。
 - facts：只写「如果忘了玩家会觉得不可接受」的事。
      · importance 5 = 刻骨铭心，只给这四种：结契、拜师、名分、生死相托
          （道侣/认主/成婚/结缘 只有明确确立名分时才算 5，日常互称不算）
@@ -218,6 +524,8 @@ JSON 格式：
      · 1~2 = 琐事，不要给
      · span 必须是从对话原文里逐字复制的片段（用于校验），至少 10 字
      · text 一句话，不超过 60 字
+     · ★ text 用她自己的视角写：第一人称「我」，对方称「他/你」；
+       像她心里记着的一句话，不要写成「玩家承诺…/某角色定下…/玩家告知…」这种报账体
      · 没有就给 []
 """;
 
@@ -230,6 +538,8 @@ JSON 格式：
             ? string.Join("；", snap.Skeleton.Relations) : "（无）"));
         sb.AppendLine("处境：" + (string.IsNullOrEmpty(snap.Skeleton.Situation)
             ? "（无）" : snap.Skeleton.Situation));
+        sb.AppendLine("过往总述：" + (string.IsNullOrWhiteSpace(snap.Skeleton.PastSummary)
+            ? "（无）" : snap.Skeleton.PastSummary));
         sb.AppendLine();
 
         var keyFacts = snap.Facts.Where(f => f.Importance >= 4).ToList();
@@ -256,6 +566,7 @@ JSON 格式：
     {
         public List<string> Relations = new();
         public string Situation = "";
+        public string PastSummary = "";
         public List<string> Summary = new();
         public List<ParsedFact> Facts = new();
     }
@@ -288,6 +599,12 @@ JSON 格式：
 
             if (root.TryGetProperty("situation", out var sit) && sit.ValueKind == JsonValueKind.String)
                 p.Situation = sit.GetString()?.Trim() ?? "";
+
+            // ★ 2026-11-02：过往总述（兼容 past_summary 写法）
+            if (root.TryGetProperty("pastSummary", out var ps) && ps.ValueKind == JsonValueKind.String)
+                p.PastSummary = ps.GetString()?.Trim() ?? "";
+            else if (root.TryGetProperty("past_summary", out var ps2) && ps2.ValueKind == JsonValueKind.String)
+                p.PastSummary = ps2.GetString()?.Trim() ?? "";
 
             if (root.TryGetProperty("summary", out var sum) && sum.ValueKind == JsonValueKind.Array)
                 foreach (var s in sum.EnumerateArray())
@@ -369,8 +686,35 @@ JSON 格式：
         if (!string.IsNullOrWhiteSpace(p.Situation))
             mem.Skeleton.Situation = p.Situation;
 
-        // ③ 摘要段：替换旧的（摘要是对历史的总述，不是增量追加）
-        var addedSummary = MemoryStore.ReplaceSummaryChunks(mem, p.Summary, 500);
+        // ★ 2026-11-07 主人定（分层代 A 方案）：过往总述改成「追加一代」。
+        //   · 模型只写「这一段发生了什么」（≤30 字，程序硬截断）
+        //   · 保留最近 Skeleton.MaxPastGens(10) 代，超了淘汰最老
+        //   · 旧数据（PastSummary 单段）已由 MemoryStore.ParseSkeleton 迁成第 0 代
+        var newPast = (p.PastSummary ?? "").Trim();
+        if (newPast.Length == 0)
+        {
+            log?.Invoke("[抽取] pastSummary 为空 → 不新增代（旧代保留）", false);
+        }
+        else
+        {
+            var segTurnForPast = todo.Count > 0 ? todo[^1].Turn : 0;
+            var gen = mem.Skeleton.AddPastGen(newPast, segTurnForPast, out var evicted);
+            if (gen != null)
+            {
+                var clipped = newPast.Length > Skeleton.GenCharLimit;
+                log?.Invoke($"[抽取] 新增第 {gen.Gen} 代总述（{gen.Text.Length} 字{(clipped ? "，已截断" : "")}）：「{gen.Text}」", false);
+            }
+            if (evicted != null)
+            {
+                var brief = evicted.Text.Length > 20 ? evicted.Text.Substring(0, 20) : evicted.Text;
+                log?.Invoke($"[抽取] 淘汰第 {evicted.Gen} 代（超过 {Skeleton.MaxPastGens} 代上限）：「{brief}」", false);
+            }
+        }
+
+        // ★ 2026-11-03：改成**追加**一段（恢复设计：摘要段不合并、不覆盖、不滚动）
+        //   段号 = 本次覆盖的最后一轮对话（重抽同一批 → 同段号 → 幂等）
+        var segTurn = todo.Count > 0 ? todo[^1].Turn : 0;
+        var addedSummary = MemoryStore.AppendSummarySegment(mem, p.Summary, segTurn, 500);
 
         // ④ facts（含程序校验）
         var addedFacts = 0;

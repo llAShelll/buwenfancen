@@ -26,6 +26,13 @@
     <Reference Include="Game"><HintPath>$(BepInExDir)\interop\Game.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="A1Ainpc.Runtime"><HintPath>$(BepInExDir)\interop\A1Ainpc.Runtime.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.CoreModule"><HintPath>$(BepInExDir)\interop\UnityEngine.CoreModule.dll</HintPath><Private>false</Private></Reference>
+    <!-- ★ 2026-11-04：选项 HUD 用 IMGUI + 动态字体 -->
+    <Reference Include="UnityEngine.IMGUIModule"><HintPath>$(BepInExDir)\interop\UnityEngine.IMGUIModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.TextRenderingModule"><HintPath>$(BepInExDir)\interop\UnityEngine.TextRenderingModule.dll</HintPath><Private>false</Private></Reference>
+    <!-- ★ 2026-11-10：选项框定位要换 Canvas 坐标 → 屏幕坐标，需要 UIModule（Canvas / RenderMode / RectTransformUtility） -->
+    <Reference Include="UnityEngine.UIModule"><HintPath>$(BepInExDir)\interop\UnityEngine.UIModule.dll</HintPath><Private>false</Private></Reference>
+    <!-- ★ 2026-11-12：性格面板支持外部纹理（config\panel\panel_bg.png）→ ImageConversion.LoadImage -->
+    <Reference Include="UnityEngine.ImageConversionModule"><HintPath>$(BepInExDir)\interop\UnityEngine.ImageConversionModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Il2Cppmscorlib"><HintPath>$(BepInExDir)\interop\Il2Cppmscorlib.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Newtonsoft.Json"><HintPath>$(BepInExDir)\interop\Newtonsoft.Json.dll</HintPath><Private>false</Private></Reference>
   </ItemGroup>

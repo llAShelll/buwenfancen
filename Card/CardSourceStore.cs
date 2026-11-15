@@ -83,13 +83,28 @@ public static class CardSourceStore
         try
         {
             var p = PathOf(npcCfgId);
-            // 兼容旧格式：{代码}.source.md
             if (!System.IO.File.Exists(p))
             {
                 var dir = System.IO.Path.GetDirectoryName(p) ?? ".";
+                // 兼容旧格式：{代码}.source.md
                 var old = System.IO.Path.Combine(dir, npcCfgId + ".source.md");
-                if (System.IO.File.Exists(old)) p = old;
-                else return null;
+                if (System.IO.File.Exists(old))
+                {
+                    p = old;
+                }
+                else
+                {
+                    // ★ 2026-10-31：按 id 通配找。
+                    //   旧版存的是「皮肤名-{id}.source.md」，现在 PathOf 用静态表真名拼路径，
+                    //   名字对不上就永远读不到 → 卡生成静默跳过（玩家反馈：聊过不生成卡）。
+                    try
+                    {
+                        var cands = System.IO.Directory.GetFiles(dir, "*-" + npcCfgId + ".source.md");
+                        if (cands.Length == 0) return null;
+                        p = cands[0];
+                    }
+                    catch { return null; }
+                }
             }
             var t = System.IO.File.ReadAllText(p, new UTF8Encoding(false));
             return string.IsNullOrWhiteSpace(t) ? null : t;

@@ -224,6 +224,23 @@ public static class MemoryEngine
             sb.AppendLine("- 关系：" + string.Join("；", mem.Skeleton.Relations));
             hasContent = true;
         }
+
+        // ★ 2026-11-02 主人定：过往总述固定注入（不靠检索）。
+        // ★ 2026-11-07 改（分层代 A 方案）：改读 RenderPastSummary()——
+        //   分代累积、每代 ≤30 字、保留最近 10 代（300 字上限），旧的会被自然挤掉。
+        var pastRendered = mem.Skeleton.RenderPastSummary();
+        if (!string.IsNullOrEmpty(pastRendered))
+        {
+            if (!hasContent) sb.AppendLine("## 长期记忆");
+            sb.AppendLine("- 过往总述：");
+            foreach (var line in pastRendered.Replace("\r\n", "\n").Split('\n'))
+            {
+                var t = line.Trim();
+                if (t.Length > 0) sb.AppendLine("  · " + t);
+            }
+            hasContent = true;
+        }
+
         if (!string.IsNullOrEmpty(mem.Skeleton.Situation))
         {
             if (!hasContent) sb.AppendLine("## 长期记忆");
@@ -254,7 +271,7 @@ public static class MemoryEngine
             if (!hasContent) sb.AppendLine("## 长期记忆");
             sb.AppendLine("- 关键事实：");
             foreach (var f in keyFacts)
-                sb.AppendLine($"  · {f.Text}（{f.Importance} 级）");
+                sb.AppendLine($"  · [{f.Importance}] {f.Text}");
             hasContent = true;
         }
 
@@ -264,6 +281,20 @@ public static class MemoryEngine
             try
             {
                 var hits = MemoryRetriever.Search(mem, query, 8);
+                // ★ 2026-11-03：命中即刷新「最近召回」——LastSeen（时间）+ LastSeenTurn（轮次）。
+                //   以前这两个字段只在创建时赋值，老化/衰减等于按「创建时间」算，不是真的「最近召回」。
+                try
+                {
+                    var curTurn = mem.Chunks.Count > 0 ? mem.Chunks.Max(c => c.Turn) : 0;
+                    var nowEpoch = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                    foreach (var h in hits)
+                    {
+                        if (h.Chunk == null) continue;
+                        h.Chunk.LastSeen = nowEpoch;
+                        if (curTurn > 0) h.Chunk.LastSeenTurn = curTurn;
+                    }
+                }
+                catch { }
                 // ★ 2026-10-26：把「开场白抄本」从注入里剔掉。
                 //   模型复述开场白时会被写成 dialog chunk，之后每次检索都把它注回上下文，
                 //   表现就是「开场白都删了，模型还在反复提开场白里的东西」。
@@ -362,6 +393,7 @@ public static class MemoryEngine
             Turn = turnNo,
             CreatedAt = now,
             LastSeen = now,
+            LastSeenTurn = turnNo,   // ★ 2026-11-03：老化按轮数（0=未知）
         };
 
         lock (_lock)

@@ -105,7 +105,8 @@ public static class RelationStore
     /// 结构：角色自己的条目 + 关系条目（都标 来源=auto），
     /// 手写条目（来源=manual）由 WriteLorebookIfAbsent 从旧文件保留。
     /// </summary>
-    public static JsonObject BuildLorebook(string npcCfgId, string npcName, int selfAge = -1, string selfBackground = "")
+    public static JsonObject BuildLorebook(string npcCfgId, string npcName, int selfAge = -1, string selfBackground = "",
+        bool skipSelf = false)
     {
         var book = new JsonObject
         {
@@ -115,7 +116,9 @@ public static class RelationStore
         var entries = (JsonArray)book["entries"]!;
 
         // ===== ① 角色自己（自动）=====
-        if (selfAge > 0 || !string.IsNullOrWhiteSpace(selfBackground))
+        // ★ 2026-11-07：skipSelf=true 表示旧文件里已有玩家手写的「角色自身」——
+        //   这时**不再自动生成**，避免出现两条「角色自身」或者把玩家写的内容覆盖掉。
+        if (!skipSelf && (selfAge > 0 || !string.IsNullOrWhiteSpace(selfBackground)))
         {
             var selfKeys = new JsonArray();
             if (!string.IsNullOrWhiteSpace(npcName)) selfKeys.Add(npcName);
@@ -209,7 +212,34 @@ public static class RelationStore
         try
         {
             var p = LorebookPathOf(npcCfgId, npcName);
-            var book = BuildLorebook(npcCfgId, npcName, selfAge, selfBackground);
+
+            // ★ 2026-11-07 修 BUG：旧文件里如果已有玩家手写的「角色自身」，
+            //   本次重建就不再自动生成自身（否则要么覆盖、要么出现两条）。
+            //   BUG 现象：控制台写完自身条目 → 重进游戏聊一句 → 自身失踪。
+            bool hasManualSelf = false;
+            try
+            {
+                if (File.Exists(p))
+                {
+                    var oldBook0 = JsonNode.Parse(File.ReadAllText(p, new UTF8Encoding(false))) as JsonObject;
+                    if (oldBook0?["entries"] is JsonArray oldArr0)
+                    {
+                        foreach (var node0 in oldArr0)
+                        {
+                            if (node0 is not JsonObject o0) continue;
+                            if (o0["来源"]?.GetValue<string>() == "manual"
+                                && o0["类型"]?.GetValue<string>() == "角色自身")
+                            {
+                                hasManualSelf = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            var book = BuildLorebook(npcCfgId, npcName, selfAge, selfBackground, skipSelf: hasManualSelf);
 
             // ★ 保留玩家手写的条目（来源=manual），只重写自动条目
             if (book["entries"] is JsonArray arr)
@@ -224,7 +254,29 @@ public static class RelationStore
                             foreach (var node in oldArr)
                             {
                                 if (node is JsonObject o && o["来源"]?.GetValue<string>() == "manual")
+                                {
+                                    // ★ 2026-11-13 修：manual 的「角色自身」条目以前整条原样保留 →
+                                    //   年龄永远停在生成时的值（纪澜之 130 不随游戏时间变）。
+                                    //   现在只更新「你今年 N 岁」里的数字，玩家手改的其它内容保留。
+                                    if (selfAge > 0 && o["类型"]?.GetValue<string>() == "角色自身")
+                                    {
+                                        try
+                                        {
+                                            var t = o["text"]?.GetValue<string>() ?? "";
+                                            if (t.Length > 0)
+                                            {
+                                                var nt = System.Text.RegularExpressions.Regex.Replace(
+                                                    t, @"你今年\s*\d+\s*岁", "你今年 " + selfAge + " 岁");
+                                                if (nt == t)
+                                                    nt = new System.Text.RegularExpressions.Regex(@"\d+\s*岁")
+                                                        .Replace(t, selfAge + " 岁", 1);
+                                                if (nt != t) o["text"] = nt;
+                                            }
+                                        }
+                                        catch { }
+                                    }
                                     arr.Add(JsonNode.Parse(o.ToJsonString()) as JsonObject);
+                                }
                             }
                         }
                     }

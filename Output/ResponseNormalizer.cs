@@ -26,6 +26,62 @@ internal static class ResponseNormalizer
 
     public static JsonObject ParseJson(string raw)
     {
+        var obj = ParseJsonCore(raw);
+        return obj == null ? null : DecodeEscapesInReply(obj);
+    }
+
+    /// <summary>
+    /// ★ 2026-11-06（主人发现）：模型偶尔把中文/标点写成 \uXXXX 转义，而且多套一层反斜杠——
+    ///   JSON 解析后得到的是字面量 "\u2026\u3011"，游戏直接显示成乱码（例：「…】」变成「\u2026\u3011」）。
+    ///   根因大概是死命令里「反斜杠写 \\」那句被过度执行了。
+    ///   这里做兜底：把 content / instruct / segments[].text 里的 \uXXXX 还原成真字符。
+    ///   模型不这么写的时候，这段完全不起作用。
+    /// </summary>
+    private static JsonObject DecodeEscapesInReply(JsonObject obj)
+    {
+        try
+        {
+            DecodeField(obj, "content");
+            DecodeField(obj, "instruct");
+            if (obj["a1ttsv2"] is JsonObject v2)
+            {
+                DecodeField(v2, "instruct");
+                if (v2["segments"] is JsonArray segs)
+                    foreach (var s in segs)
+                        if (s is JsonObject so) DecodeField(so, "text");
+            }
+        }
+        catch { }
+        return obj;
+    }
+
+    private static void DecodeField(JsonObject o, string key)
+    {
+        if (o == null) return;
+        try
+        {
+            if (o[key] is JsonValue jv && jv.TryGetValue<string>(out var s) && s != null && s.Contains("\\u"))
+                o[key] = DecodeUnicodeEscapes(s);
+        }
+        catch { }
+    }
+
+    private static string DecodeUnicodeEscapes(string s)
+    {
+        if (string.IsNullOrEmpty(s) || s.IndexOf("\\u", StringComparison.Ordinal) < 0) return s;
+        try
+        {
+            return Regex.Replace(s, @"\\u([0-9a-fA-F]{4})", m =>
+            {
+                try { return ((char)Convert.ToInt32(m.Groups[1].Value, 16)).ToString(); }
+                catch { return m.Value; }
+            });
+        }
+        catch { return s; }
+    }
+
+    private static JsonObject ParseJsonCore(string raw)
+    {
         if (string.IsNullOrWhiteSpace(raw)) return null;
         var t = raw.Trim();
 
@@ -82,7 +138,8 @@ internal static class ResponseNormalizer
         if (string.IsNullOrWhiteSpace(raw)) return "";
         var t = StripFence(raw.Trim());
         var cand = ExtractOutermostObject(t);
-        return (cand != null ? t.Replace(cand, "") : t).Trim();
+        // ★ 2026-11-06：纯文本路径也要解码 \uXXXX（模型可能整段输出不带 JSON 外壳）
+        return DecodeUnicodeEscapes((cand != null ? t.Replace(cand, "") : t).Trim());
     }
 
     private static bool TryParse(string s, out JsonObject obj)

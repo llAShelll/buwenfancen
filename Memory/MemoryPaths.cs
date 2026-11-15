@@ -56,6 +56,15 @@ public static class MemoryPaths
         return System.IO.Path.Combine(Root, "card", Sanitize(npcCfgId) + ".json");
     }
 
+    /// <summary>面板路径：{Root}\{Scope}\panel\{NpcCfgId}.json（★ 2026-11-12：NPC 数值面板，与记忆同作用域）</summary>
+    public static string PanelPath(string npcCfgId)
+    {
+        var p = Root;
+        if (!string.IsNullOrEmpty(Scope))
+            p = System.IO.Path.Combine(p, Scope);
+        return System.IO.Path.Combine(p, "panel", Sanitize(npcCfgId) + ".json");
+    }
+
     /// <summary>BGE 模型目录（插件目录\model\bge）</summary>
     public static string BgeModelDir
     {

@@ -240,6 +240,9 @@ public static class ConsoleServer
             case "/api/config":
                 HandleConfig(ctx);
                 break;
+            case "/api/panel":
+                HandlePanel(ctx);
+                break;
             case "/api/npcs":
                 TryWrite(ctx, 200, "application/json; charset=utf-8", NpcsJson());
                 break;
@@ -256,13 +259,20 @@ public static class ConsoleServer
                 HandleSummary(ctx);
                 break;
             case "/api/memory/reclassify":
-                HandleMemoryTool(ctx, true);
+                HandleMemoryTool(ctx, "reclassify");
                 break;
             case "/api/memory/compress":
-                HandleMemoryTool(ctx, false);
+                HandleMemoryTool(ctx, "compress");
+                break;
+            case "/api/memory/rewritefacts":
+                HandleMemoryTool(ctx, "rewritefacts");
                 break;
             case "/api/memory/extract":
                 HandleMemoryExtract(ctx);
+                break;
+            case "/api/memory/compresspast":
+                // ★ 2026-11-07（B 方案）：把旧的总述第 0 代压成 30 字
+                HandleCompressPastGen(ctx);
                 break;
             case "/api/memory/delete":
                 HandleDeleteMemory(ctx);
@@ -302,6 +312,9 @@ public static class ConsoleServer
                 break;
             case "/api/card/cleanoldnames":
                 HandleCardCleanOldNames(ctx);
+                break;
+            case "/api/card/genfromsource":
+                HandleCardGenFromSource(ctx);
                 break;
             case "/api/migrate/scan":
                 HandleMigrateScan(ctx);
@@ -407,6 +420,89 @@ public static class ConsoleServer
         }
     }
 
+    /// <summary>★ 2026-11-12：面板状态读取 / 手动改值（控制台「手动改数值（作弊）」区）。
+    /// GET  /api/panel → 当前对话 NPC 的面板状态
+    /// POST /api/panel → {action:"set", axis:0~7, value:N} / {action:"reset"} / {action:"lock", value:bool}</summary>
+    private static void HandlePanel(HttpListenerContext ctx)
+    {
+        try
+        {
+            if (ctx.Request.HttpMethod == "POST")
+            {
+                string body;
+                using (var sr = new System.IO.StreamReader(ctx.Request.InputStream, Encoding.UTF8))
+                    body = sr.ReadToEnd();
+                var node = System.Text.Json.Nodes.JsonNode.Parse(body) as System.Text.Json.Nodes.JsonObject;
+                if (node == null)
+                {
+                    TryWrite(ctx, 400, "application/json; charset=utf-8", "{\"ok\":false,\"msg\":\"bad json\"}");
+                    return;
+                }
+
+                var npc = node["npcId"]?.ToString();
+                if (string.IsNullOrEmpty(npc)) npc = BuWenFanChen.Panel.PanelStore.LastNpcId;
+                var action = node["action"]?.ToString() ?? "set";
+                bool ok = false;
+                string msg = "";
+
+                if (action == "set")
+                {
+                    int axis = -1, value = 0;
+                    try { axis = (int)Math.Round(node["axis"]?.GetValue<double>() ?? -1); } catch { }
+                    try { value = (int)Math.Round(node["value"]?.GetValue<double>() ?? 0); } catch { }
+                    ok = BuWenFanChen.Panel.PanelStore.SetValue(npc, axis, value);
+                    msg = ok ? "已设置" : "设置失败";
+                }
+                else if (action == "reset")
+                {
+                    BuWenFanChen.Panel.PanelStore.ResetByKeywords(npc);
+                    ok = true; msg = "已按本地规则重置";
+                }
+                else if (action == "lock")
+                {
+                    bool lk = false;
+                    try { lk = node["value"]?.GetValue<bool>() ?? false; } catch { }
+                    BuWenFanChen.Panel.PanelStore.SetLocked(npc, lk);
+                    ok = true; msg = lk ? "已锁定" : "已解锁";
+                }
+                else msg = "不认识的动作";
+
+                TryWrite(ctx, 200, "application/json; charset=utf-8",
+                    "{\"ok\":" + (ok ? "true" : "false") + ",\"msg\":\"" + JsonEscape(msg) + "\"}");
+                return;
+            }
+
+            var id = ctx.Request.QueryString["npc"];
+            if (string.IsNullOrEmpty(id)) id = BuWenFanChen.Panel.PanelStore.LastNpcId;
+            if (string.IsNullOrEmpty(id))
+            {
+                TryWrite(ctx, 200, "application/json; charset=utf-8", "{\"ok\":false,\"msg\":\"先和任意角色聊一句\"}");
+                return;
+            }
+            var st = BuWenFanChen.Panel.PanelStore.Peek(id);
+            var sb = new StringBuilder();
+            sb.Append("{\"ok\":true");
+            sb.Append(",\"npcId\":\"").Append(JsonEscape(st.NpcId ?? id)).Append('"');
+            sb.Append(",\"npcName\":\"").Append(JsonEscape(st.NpcName ?? "")).Append('"');
+            sb.Append(",\"rounds\":").Append(st.Rounds);
+            sb.Append(",\"nsfwIdleRounds\":").Append(st.NsfwIdleRounds);
+            sb.Append(",\"locked\":").Append(st.Locked ? "true" : "false");
+            sb.Append(",\"initSource\":\"").Append(JsonEscape(st.InitSource ?? "")).Append('"');
+            sb.Append(",\"hideNsfw\":").Append(BuWenFanChen.PromptConfig.HideNsfw ? "true" : "false");
+            sb.Append(",\"values\":[");
+            for (int i = 0; i < 8; i++) { if (i > 0) sb.Append(','); sb.Append(st.Values[i]); }
+            sb.Append("],\"base\":[");
+            for (int i = 0; i < 4; i++) { if (i > 0) sb.Append(','); sb.Append(st.Base[i]); }
+            sb.Append("]}");
+            TryWrite(ctx, 200, "application/json; charset=utf-8", sb.ToString());
+        }
+        catch (Exception e)
+        {
+            TryWrite(ctx, 500, "application/json; charset=utf-8",
+                "{\"ok\":false,\"msg\":\"" + JsonEscape(e.GetType().Name + ": " + e.Message) + "\"}");
+        }
+    }
+
     private static string SaveConfig(string body)
     {
         try
@@ -417,16 +513,21 @@ public static class ConsoleServer
 
             // 白名单字段（只允许这些，防玩家塞奇怪字段）
             var allowed = new[] {
-                "tier", "dumpEnabled", "dumpKeep", "fallbackEnabled", "fallbackAlways",
+                "tier", "dumpEnabled", "dumpKeep",
                 "replyLenTotal", "replyLenNarration", "replyLenDialogue", "replyLenHardRatio", "replyLenLo",
-                "nsfwMode", "nsfwLatch", "extractInterval", "allowNpcActing", "cardEnabled",
+                "nsfwMode", "nsfwLatch", "hideNsfw", "extractInterval", "allowNpcActing", "cardEnabled",
+                "outputLanguage", "panelEnabled", "panelNsfwMode", "panelForMale",
                 "cardModel", "consoleAutoOpen", "consoleAppMode", "consoleWinW", "consoleWinH",
                 "modApiUrl", "modApiKey", "modModel", "memoryInjectLimit",
                 "memoryEnabled", "worldbookEnabled", "lorebookEnabled", "nsfwEnabled", "cardEnabled",
-                "replaceOfficialProfile",
+                "replaceOfficialProfile", "optionsEnabled",
                 "autoIntimacyEnabled", "autoIntimacyMaxUp", "autoIntimacyMaxDown",
                 "autoIntimacyPositive", "autoIntimacyNegative",
-                "autoIntimacyApiUrl", "autoIntimacyApiKey", "autoIntimacyModel", "autoIntimacyMode"
+                "autoIntimacyApiUrl", "autoIntimacyApiKey", "autoIntimacyModel", "autoIntimacyMode",
+                // ★ 2026-11-07：canon 三旋钮（保留轮数 / 裁剪节拍 / 记忆合并节拍）
+                "canonKeepRounds", "canonArchiveEvery", "canonMergeEvery",
+                // ★ 2026-11-07：玩家主角设定（覆盖/新增「## 当前场景 → 对话对象」）
+                "playerName", "playerGender", "playerRealm", "playerSect", "playerExtra"
             };
 
             // 读现有配置，只覆盖白名单里出现的
@@ -659,8 +760,8 @@ public static class ConsoleServer
         catch (Exception e) { Log("打开文件夹失败：" + e.Message); }
     }
 
-    /// <summary>一键迁移：重评重要度 / 压缩摘要（会调模型，几秒到十几秒）</summary>
-    private static void HandleMemoryTool(HttpListenerContext ctx, bool reclassify)
+    /// <summary>一键迁移：重评重要度 / 压缩摘要 / 重写事实文风（会调模型，几秒到十几秒）</summary>
+    private static void HandleMemoryTool(HttpListenerContext ctx, string kind)
     {
         var npc = ctx.Request.QueryString["npc"] ?? "";
         if (string.IsNullOrEmpty(npc))
@@ -670,9 +771,12 @@ public static class ConsoleServer
         }
         try
         {
-            var task = reclassify
-                ? BuWenFanChen.Memory.MemoryTools.ReclassifyAsync(npc)
-                : BuWenFanChen.Memory.MemoryTools.CompressAsync(npc);
+            var task = kind switch
+            {
+                "reclassify" => BuWenFanChen.Memory.MemoryTools.ReclassifyAsync(npc),
+                "compress" => BuWenFanChen.Memory.MemoryTools.CompressAsync(npc),
+                _ => BuWenFanChen.Memory.MemoryTools.RewriteFactsAsync(npc),
+            };
             var (ok, msg) = task.GetAwaiter().GetResult();
             TryWrite(ctx, 200, "application/json; charset=utf-8",
                 "{\"ok\":" + (ok ? "true" : "false") + ",\"msg\":\"" + JsonEscape(msg) + "\"}");
@@ -681,6 +785,28 @@ public static class ConsoleServer
         {
             TryWrite(ctx, 200, "application/json; charset=utf-8",
                 "{\"ok\":false,\"msg\":\"" + JsonEscape("执行失败：" + e.Message) + "\"}");
+        }
+    }
+
+    /// <summary>★ 2026-11-07（B 方案）：把旧格式第 0 代总述压成 30 字，让风格跟新代统一。</summary>
+    private static void HandleCompressPastGen(HttpListenerContext ctx)
+    {
+        var npc = ctx.Request.QueryString["npc"] ?? "";
+        if (string.IsNullOrEmpty(npc))
+        {
+            TryWrite(ctx, 400, "application/json; charset=utf-8", "{\"ok\":false,\"msg\":\"缺少 npc 参数\"}");
+            return;
+        }
+        try
+        {
+            var (ok, msg) = BuWenFanChen.Memory.Extractor.CompressLegacyPastGen(npc);
+            TryWrite(ctx, 200, "application/json; charset=utf-8",
+                "{\"ok\":" + (ok ? "true" : "false") + ",\"msg\":\"" + JsonEscape(msg) + "\"}");
+        }
+        catch (Exception e)
+        {
+            TryWrite(ctx, 200, "application/json; charset=utf-8",
+                "{\"ok\":false,\"msg\":\"" + JsonEscape("压缩失败：" + e.Message) + "\"}");
         }
     }
 
@@ -1033,7 +1159,7 @@ public static class ConsoleServer
             {
                 diag.AppendLine($"回复上限={PromptConfig.ReplyLenTotal}（旁白{PromptConfig.ReplyLenNarration}+台词{PromptConfig.ReplyLenDialogue}）");
                 diag.AppendLine($"情事模式={BuWenFanChen.NsfwConfig.Mode} 锁存={BuWenFanChen.NsfwConfig.LatchRounds}轮");
-                diag.AppendLine($"抽取间隔={PromptConfig.ExtractInterval} 兜底={PromptConfig.FallbackEnabled} 角色卡开关={PromptConfig.CardEnabled}");
+                diag.AppendLine($"抽取间隔={PromptConfig.ExtractInterval} 角色卡开关={PromptConfig.CardEnabled}");
             }
             catch { }
             diag.AppendLine();
@@ -1238,6 +1364,76 @@ public static class ConsoleServer
         {
             TryWrite(ctx, 200, "application/json; charset=utf-8",
                 "{\"ok\":false,\"msg\":\"" + JsonEscape("生成失败：" + e.Message) + "\"}");
+        }
+    }
+
+    /// <summary>
+    /// 「根据原文写卡」（2026-10-31 主人要）：读 card\{名}-{id}.source.md → 调模型写整张卡 → 直接保存。
+    /// 用途：自动生成出问题时的**手动兜底**。
+    /// 正常情况：第一次跟角色聊天时插件就会自动生成，不需要点这个。
+    /// </summary>
+    private static void HandleCardGenFromSource(HttpListenerContext ctx)
+    {
+        if (ctx.Request.HttpMethod != "POST")
+        {
+            TryWrite(ctx, 405, "application/json; charset=utf-8", "{\"ok\":false,\"msg\":\"只接受 POST\"}");
+            return;
+        }
+        var npc = ctx.Request.QueryString["npc"] ?? "";
+        if (string.IsNullOrEmpty(npc))
+        {
+            TryWrite(ctx, 400, "application/json; charset=utf-8", "{\"ok\":false,\"msg\":\"缺少 npc 参数\"}");
+            return;
+        }
+        try
+        {
+            var material = BuWenFanChen.Card.CardSourceStore.Load(npc);
+            if (string.IsNullOrWhiteSpace(material))
+            {
+                TryWrite(ctx, 200, "application/json; charset=utf-8",
+                    "{\"ok\":false,\"msg\":\"" + JsonEscape(
+                        "还没抓到角色原文：先跟这个角色聊一句（插件会自动抓），"
+                        + "再看下面「角色资料」区有没有内容") + "\"}");
+                return;
+            }
+
+            var (ok, data) = BuWenFanChen.Card.CardGenerator
+                .GenerateAsync(npc, material)
+                .GetAwaiter().GetResult();
+            if (!ok)
+            {
+                TryWrite(ctx, 200, "application/json; charset=utf-8",
+                    "{\"ok\":false,\"msg\":\"" + JsonEscape(data) + "\"}");
+                return;
+            }
+
+            var obj = System.Text.Json.Nodes.JsonNode.Parse(data) as System.Text.Json.Nodes.JsonObject;
+            if (obj == null)
+            {
+                TryWrite(ctx, 200, "application/json; charset=utf-8",
+                    "{\"ok\":false,\"msg\":\"模型返回的不是合法 JSON，没保存\"}");
+                return;
+            }
+
+            // 旧卡先备份（覆盖前留一条退路）
+            try
+            {
+                var old = BuWenFanChen.Card.CardStore.ResolvePath(npc);
+                if (old != null && System.IO.File.Exists(old))
+                    System.IO.File.Move(old, old + ".重写备份_" + DateTime.Now.ToString("yyyyMMdd_HHmmss"), overwrite: true);
+            }
+            catch { }
+
+            var saved = BuWenFanChen.Card.CardStore.Save(npc, obj);
+            TryWrite(ctx, 200, "application/json; charset=utf-8",
+                "{\"ok\":" + (saved ? "true" : "false") + ",\"msg\":\"" + JsonEscape(
+                    saved ? $"已按原文写好并保存（{obj.ToJsonString().Length} 字，旧卡已备份）"
+                          : "写好了但保存失败") + "\"}");
+        }
+        catch (Exception e)
+        {
+            TryWrite(ctx, 200, "application/json; charset=utf-8",
+                "{\"ok\":false,\"msg\":\"" + JsonEscape("写卡失败：" + e.Message) + "\"}");
         }
     }
 
@@ -2381,7 +2577,7 @@ public static class ConsoleServer
             try
             {
                 var ok = BuWenFanChen.Memory.RelationStore.WriteLorebookIfAbsent(npc, name, overwrite: true,
-                    selfAge: BuWenFanChen.Memory.ConfigTable.GetCachedAge(npc),
+                    selfAge: BuWenFanChen.Memory.ConfigTable.GetCurrentAge(npc),
                     selfBackground: BuWenFanChen.Memory.ConfigTable.GetCachedBg(npc));
                 TryWrite(ctx, 200, "application/json; charset=utf-8",
                     ok ? "{\"ok\":true,\"msg\":\"已从游戏关系网重新生成\"}"
@@ -3282,14 +3478,38 @@ public static class ConsoleServer
                 }
             }
             var situation = (node?["situation"]?.GetValue<string>() ?? "").Trim();
+            // ★ 2026-11-02：过往总述（可空；超限拦下不让存，绝不静默截断）
+            var pastSummary = (node?["pastSummary"]?.GetValue<string>() ?? "").Trim();
+            if (pastSummary.Length > BuWenFanChen.Memory.Skeleton.MaxPastSummaryChars)
+            {
+                TryWrite(ctx, 200, "application/json; charset=utf-8",
+                    "{\"ok\":false,\"msg\":\"" + JsonEscape(
+                        "过往总述超 " + BuWenFanChen.Memory.Skeleton.MaxPastSummaryChars +
+                        " 字（当前 " + pastSummary.Length + " 字），请删减后再保存") + "\"}");
+                return;
+            }
 
             var mem = BuWenFanChen.Memory.MemoryStore.Load(npc);
             mem.Skeleton.Relations = rels;
             mem.Skeleton.Situation = situation;
+            // ★ 2026-11-07（分层代 A 方案）：玩家手动编辑 = 重置总述。
+            //   清空分代，把编辑内容作为第 0 代存进 PastGens（这样下次加载/渲染一致）。
+            mem.Skeleton.PastGens = new System.Collections.Generic.List<BuWenFanChen.Memory.PastGen>();
+            mem.Skeleton.PastSummary = pastSummary;
+            if (!string.IsNullOrWhiteSpace(pastSummary))
+            {
+                mem.Skeleton.PastGens.Add(new BuWenFanChen.Memory.PastGen
+                {
+                    Gen = 0,
+                    Text = pastSummary.Replace("\r", " ").Replace("\n", " ").Trim(),
+                    Turn = 0
+                });
+            }
             BuWenFanChen.Memory.MemoryStore.Save(mem);
 
             TryWrite(ctx, 200, "application/json; charset=utf-8",
-                "{\"ok\":true,\"msg\":\"骨架已保存（关系 " + rels.Count + " 条）\"}");
+                "{\"ok\":true,\"msg\":\"骨架已保存（关系 " + rels.Count + " 条，过往总述 " + pastSummary.Length +
+                " 字；已重置为第 0 代）\"}");
         }
         catch (Exception e)
         {
@@ -3375,6 +3595,20 @@ public static class ConsoleServer
             sb.Append(string.Join(",", mem.Skeleton.Relations.Select(r => "\"" + JsonEscape(r) + "\"")));
             sb.Append("],");
             sb.Append("\"situation\":\"").Append(JsonEscape(mem.Skeleton.Situation ?? "")).Append("\",");
+            // ★ 2026-11-02：过往总述（每轮固定注入，玩家可编辑）
+            // ★ 2026-11-07：返回**渲染后的多代拼接**（玩家看到的就是实际注入的内容）
+            sb.Append("\"pastSummary\":\"").Append(JsonEscape(mem.Skeleton.RenderPastSummary() ?? "")).Append("\",");
+            sb.Append("\"pastSummaryMax\":").Append(BuWenFanChen.Memory.Skeleton.MaxPastSummaryChars).Append(',');
+            // ★ 2026-11-07：顺便把各代明细给前端（控制台可以展示代数/淘汰情况）
+            sb.Append("\"pastGens\":[");
+            if (mem.Skeleton.PastGens != null)
+            {
+                sb.Append(string.Join(",", mem.Skeleton.PastGens.Select(g =>
+                    "{\"gen\":" + g.Gen + ",\"text\":\"" + JsonEscape(g.Text ?? "") + "\",\"turn\":" + g.Turn + "}")));
+            }
+            sb.Append("],");
+            sb.Append("\"pastGenMax\":").Append(BuWenFanChen.Memory.Skeleton.MaxPastGens).Append(',');
+            sb.Append("\"pastGenLimit\":").Append(BuWenFanChen.Memory.Skeleton.GenCharLimit).Append(',');
 
             // facts
             sb.Append("\"facts\":[");
@@ -3388,7 +3622,7 @@ public static class ConsoleServer
             //   它们的 Turn 都比旧对话大 → 摘要把 30 条名额占满，对话原文一条都显示不出来。
             //   玩家反馈「摘要一直在更新、对话原文不更新」就是这个原因（数据其实在写，只是没显示）。
             var sumPicked = mem.Chunks.Where(c => c.Kind == BuWenFanChen.Memory.ChunkKind.Summary)
-                .OrderByDescending(c => c.Turn).ThenByDescending(c => c.Id).Take(60).ToList();
+                .OrderByDescending(c => c.Turn).ThenByDescending(c => c.Id).Take(300).ToList();
             var dlgPicked = mem.Chunks.Where(c => c.Kind != BuWenFanChen.Memory.ChunkKind.Summary)
                 .OrderByDescending(c => c.Turn).ThenByDescending(c => c.Id).Take(30).ToList();
             sb.Append("\"chunks\":[");
@@ -3460,7 +3694,7 @@ public static class ConsoleServer
 <head>
 <meta charset=""UTF-8"">
 <meta name=""viewport"" content=""width=device-width, initial-scale=1"">
-<title>不问凡尘 V1.2.2 · 控制台</title>
+<title>不问凡尘 V1.4.0 · 控制台</title>
 <style>
   :root{--bg:#0b1218;--panel:rgba(16,19,25,.72);--panel2:rgba(24,28,37,.78);--line:rgba(88,96,112,.55);
         --txt:#e8eaf0;--dim:#9aa2b1;--jade:#4fc3a1;--gold:#d9a441;--red:#e06c6c}
@@ -3582,7 +3816,7 @@ public static class ConsoleServer
 <div class=""wrap"">
   <header>
     <span class=""dot on""></span>
-    <h1>不问凡尘 V1.2.2 · 控制台</h1>
+    <h1>不问凡尘 V1.4.0 · 控制台</h1>
     <span class=""badge"" id=""statusBadge"">读取中…</span>
     <span class=""badge"" id=""apiBadge"" style=""display:none"">接口：—</span>
     <div class=""hinfo"">
@@ -3597,10 +3831,10 @@ public static class ConsoleServer
     <button class=""on"" data-p=""p3"" data-g=""cfg"">全局设置</button>
     <button data-p=""p5"" data-g=""cfg"">长期记忆</button>
     <button data-p=""p10"" data-g=""cfg"">NSFW 模块</button>
-    <button data-p=""p14"" data-g=""cfg"">世界书</button>
+    <button data-p=""p14"" data-g=""cfg"">世界设定</button>
     <button data-p=""p4"" data-g=""cfg"">角色卡编辑</button>
     <button data-p=""p7"" data-g=""cfg"">角色卡优化</button>
-    <button data-p=""p16"" data-g=""cfg"">自动好感度</button>
+    <button data-p=""p16"" data-g=""cfg"">DIY自动化</button>
     <button data-p=""p8"" data-g=""tool"">Token 预览</button>
     <button data-p=""p15"" data-g=""tool"">迁移</button>
     <button data-p=""p2"" data-g=""help"">日志</button>
@@ -3617,7 +3851,6 @@ public static class ConsoleServer
       <div class=""stat"">
         <div><b id=""statTotal"">200</b><span>总上限（字）</span></div>
         <div><b id=""statNsfw"">auto</b><span>情事模式</span></div>
-        <div><b id=""statFallback"">关</b><span>兜底补写</span></div>
         <div><b id=""statExtract"">30</b><span>抽取间隔（轮）</span></div>
       </div>
 
@@ -3628,7 +3861,7 @@ public static class ConsoleServer
       </label>
       <p class=""hint"" style=""margin-top:-2px"">
         开启后：AI 可以让「当前场景里在场的其他人」也说一句，写法是用【名字】开头，例如【某某】""这笔账已核过。""<br>
-        默认关。关着时只演当前角色，别人的话只用旁白转述。<b>不依赖角色卡：勾上、重启游戏后就生效（没卡的角色也生效）。</b><br>
+        默认关。关着时只演当前角色，别人的话只用旁白转述。<b>不依赖角色卡：勾上、存盘即生效（没卡的角色也生效）。</b><br>
         每次最多让一个人说一句，主体仍是当前角色，不会变成大段群戏。
       </p>
 
@@ -3689,6 +3922,18 @@ public static class ConsoleServer
       </table>
       <p class=""hint"">你当前填的台词上限：<b id=""dialVal"">80</b> 字 → 约 <b id=""secVal"">9.2</b> 秒语音（按 8.7 字/秒估算）</p>
 
+      <div class=""sechead"">输出语言</div>
+      <div class=""row""><label>AI 回复语言<span class=""ok"">存盘即生效</span></label>
+        <select id=""outputLanguage"">
+          <option value=""zh-CN"">简体中文（默认）</option>
+          <option value=""zh-TW"">繁體中文（台灣用語）</option>
+          <option value=""en"">English</option>
+        </select>
+      </div>
+      <p class=""hint"" style=""margin-top:-6px"">只改 AI 说出来的文字：游戏 UI、任务、界面一概不动，历史记录也不翻译。<br>
+      · 切完头 1~2 轮可能混一点旧语言，属正常；之后每轮都按这里锁定。<br>
+      · <b>不适配语音 MOD</b>：英文/繁体模式下语音可能读不出来或读错字，介意就把语音关掉。</p>
+
       <div class=""sechead"">情事板块</div>
       <div class=""row""><label>注入模式<span class=""ok"">存盘即生效</span></label>
         <select id=""nsfwMode"">
@@ -3702,8 +3947,50 @@ public static class ConsoleServer
       <p class=""hint"" style=""margin-top:-6px"">触发一次后，接下来这么多轮继续注入，避免氛围突然断掉。默认 5 轮。</p>
 
       <div class=""sechead"">记忆与其它</div>
-      <div class=""row""><label>抽取间隔（轮）<span class=""ok"">存盘即生效</span></label><input id=""extractInterval"" type=""number""></div>
-      <p class=""hint"" style=""margin-top:-6px"">每聊这么多轮，自动把最近的对话总结进长期记忆。太小费 token，太大容易记不住细节。</p>
+      <div class=""row""><label>记忆更新节拍<span class=""dim"">（跟档位走，只读）</span></label><input id=""extractInterval"" type=""number"" readonly style=""opacity:.65""></div>
+      <p class=""hint"" style=""margin-top:-6px"">每这么多轮把最近的对话提炼进长期记忆（摘要 / 关键事实 / 关系 / 处境）。<br>
+      ★ 2026-11-07 起<b>跟上下文档位走</b>：MAX 12 / High 24 / Low 36 / Off 48 轮，不用单独调。
+      太小费 token，太大容易记不住细节。</p>
+      <div class=""row""><label>上下文档位<span class=""ok"">改完重启生效</span></label>
+        <select id=""canonTier"" style=""flex:1"" onchange=""updateCanonHint()"">
+          <option value=""max"">MAX · 8 / 4 / 8（记忆最新鲜 · 合并最勤 · 最贵）</option>
+          <option value=""high"">High · 10 / 6 / 24（默认）</option>
+          <option value=""low"">Low · 15 / 8 / 36</option>
+          <option value=""off"">Off · 20 / 10 / 48（最省 · 格式最不稳）</option>
+        </select>
+      </div>
+      <p class=""hint"" id=""canonTierHint"" style=""margin-top:-6px""></p>
+      <p class=""hint"" style=""margin-top:-6px"">三个数字 = <b>保留 / 裁剪 / 合并</b>（单位：轮）。<b>不影响记忆细节</b>（事实/摘要/骨架独立存）。<br>
+      · <b>裁剪</b>：canon 涨到「保留+裁剪」就滚一次，窗口 = 保留 ~ 保留+裁剪-1。裁得越勤窗口越短、掉 JSON 越少，但缓存断点越多。<br>
+      · <b>合并</b>：每这么多轮把积压的归档内容一次性整合进「过往总述」（裁剪落盘、合并才调 LLM）。合并越勤记忆越新，但断点更多、更费钱。<br>
+      实测（带 14 字格式指令，按真实游戏请求重放）：掉 JSON 概率 MAX≈3% / High≈2% / Low≈3% / Off≈11%。</p>
+      <table style=""width:100%;border-collapse:collapse;font-size:12px;margin:4px 0 6px"">
+        <thead><tr style=""color:var(--dim);text-align:left"">
+          <th style=""padding:5px 6px;border-bottom:1px solid rgba(255,255,255,.18)"">档位</th>
+          <th style=""padding:5px 6px;border-bottom:1px solid rgba(255,255,255,.18)"">保留 / 裁剪 / 合并</th>
+          <th style=""padding:5px 6px;border-bottom:1px solid rgba(255,255,255,.18)"">窗口</th>
+          <th style=""padding:5px 6px;border-bottom:1px solid rgba(255,255,255,.18)"">掉 JSON</th>
+          <th style=""padding:5px 6px;border-bottom:1px solid rgba(255,255,255,.18)"">缓存命中</th>
+          <th style=""padding:5px 6px;border-bottom:1px solid rgba(255,255,255,.18)"">未命中 tokens/轮</th>
+          <th style=""padding:5px 6px;border-bottom:1px solid rgba(255,255,255,.18)"">特点</th>
+        </tr></thead>
+        <tbody>
+          <tr><td style=""padding:5px 6px;border-bottom:1px solid rgba(255,255,255,.08)""><b>MAX</b></td>
+              <td>8 / 4 / 8</td><td>8~11 轮</td><td>约 3%</td><td>约 39%</td><td>约 9,200</td>
+              <td>记忆最新鲜（8 轮合并一次），最贵</td></tr>
+          <tr><td style=""padding:5px 6px;border-bottom:1px solid rgba(255,255,255,.08)""><b>High</b> <span style=""color:var(--jade);font-size:11px"">默认</span></td>
+              <td>10 / 6 / 24</td><td>10~15 轮</td><td>约 2%</td><td>约 51%</td><td>约 7,900</td>
+              <td>均衡，日常推荐</td></tr>
+          <tr><td style=""padding:5px 6px;border-bottom:1px solid rgba(255,255,255,.08)""><b>Low</b></td>
+              <td>15 / 8 / 36</td><td>15~22 轮</td><td>约 4%</td><td>约 60%</td><td>约 7,800</td>
+              <td>省钱，记忆更新慢一些</td></tr>
+          <tr><td style=""padding:5px 6px""><b>Off</b></td>
+              <td>20 / 10 / 48</td><td>20~29 轮</td><td>约 11%</td><td>约 66%</td><td>约 7,700</td>
+              <td>最省，掉格式明显变多</td></tr>
+        </tbody>
+      </table>
+      <p class=""hint"" style=""margin-top:0"">※ 掉 JSON 来自 1,120 次真实请求重放（带 14 字格式指令）；缓存命中与 tokens 为离线模型估算（误差约 3 个点）。<br>
+      窗口越长 → 原文看得越多、但掉格式越多；合并越勤 → 记忆越新、但更费钱。</p>
       <div class=""row""><label>角色卡总开关<span class=""ok"">存盘即生效</span></label>
         <select id=""cardEnabled""><option value=""true"">开</option><option value=""false"">关</option></select>
       </div>
@@ -3741,6 +4028,8 @@ public static class ConsoleServer
 
       <button class=""save"" onclick=""saveSettings()"">保存</button>
       <span class=""msg"" id=""settingsMsg""></span>
+      <div class=""sechead"" style=""margin-top:18px"">过审 / 录屏</div>
+      <div class=""masterswitch"" style=""margin-top:10px""><div style=""flex:1""><b>过审模式（不注入任何 NSFW 内容）</b><div class=""dim"">开启后：控制台「NSFW 模块」页消失、角色卡里的 NSFW 分区隐藏、提示词<b>完全不注入</b> NSFW 块（连 AI 都收不到）。<br><b>★ 教学视频 / 直播录屏专用，平时别开。</b>存盘即生效。</div></div><label class=""switch""><input type=""checkbox"" id=""sw-hideNsfw"" onchange=""saveMasterSwitch('hideNsfw', this.checked)""><span></span></label><span class=""msg"" id=""swmsg-hideNsfw""></span></div>
     </section>
 
     <!-- ========== p5 长期记忆 ========== -->
@@ -3766,13 +4055,16 @@ public static class ConsoleServer
       <div class=""refresh-tip"">
         ⚠ 本页<b>编辑的内容保存后会自动刷新</b>，不用按 F5；只有「在游戏里新聊的对话」要按 <b>F5</b> 才会显示出来。
       </div>
+      <div style=""margin-bottom:8px""><input id=""npcSearch"" type=""text"" placeholder=""搜索角色名 / 编号…"" oninput=""filterNpcs()"" style=""width:100%""></div>
       <div class=""split"">
         <div class=""list"" id=""npcList""></div>
         <div>
           <div id=""memHead"" class=""hint"">← 选一个角色</div>
           <div id=""memBody"" style=""display:none"">
             <h3>骨架</h3>
-            <p class=""hint"">关系可以逐条改、删（删掉就是她不再记得）、新增；处境是当前状态。改完点「保存骨架」。</p>
+            <p class=""hint"">关系可以逐条改、删（删掉就是她不再记得）、新增；处境是当前状态。改完点「保存骨架」。<br>
+            <b>过往总述</b>=「之前发生过什么」的脉络，每轮固定注入、不靠检索（上限 300 字，超了不让存）。
+            如果总述是空的，先点下面「立即整理」——它会调一次模型，把整段历史压成这份目录（只写事件与结果，不写细节），再手动改。</p>
             <div id=""memSkeleton"" style=""font-size:13px;line-height:1.8""></div>
             <div style=""margin-top:8px""><button class=""ghost"" onclick=""saveSkeleton()"">保存骨架</button><span class=""msg"" id=""skelMsg""></span></div>
             <h3>关键事实</h3>
@@ -3783,10 +4075,11 @@ public static class ConsoleServer
             <p class=""hint"">摘要段可直接改文字（保存后自动重算向量）、删除；对话原文只读。</p>
             <div id=""memChunks""></div>
             <h3>一键迁移</h3>
-            <p class=""hint"">这两个操作会调用模型，需要几秒到十几秒；执行前会自动备份原文件。</p>
+            <p class=""hint"">这几个操作会调用模型，需要几秒到十几秒；执行前会自动备份原文件。</p>
             <button class=""ghost"" onclick=""doTool('extract')"">立即整理</button>
         <button class=""ghost"" onclick=""doTool('reclassify')"">重评重要度</button>
             <button class=""ghost"" onclick=""doTool('compress')"">压缩旧对话</button>
+            <button class=""ghost"" onclick=""doTool('rewritefacts')"">重写事实文风</button>
         <button class=""ghost"" onclick=""cleanBackup('all','','全部')"">清理全部备份</button>
             <span class=""msg"" id=""toolMsg""></span>
             <h3>从其他存档继承记忆</h3>
@@ -3843,9 +4136,29 @@ public static class ConsoleServer
       <p class=""hint"" style=""margin-top:10px"">位置：插件目录\config\nsfw\ ｜ <button class=""ghost"" onclick=""fetch('/api/openfolder')"">打开配置文件夹</button></p>
     </section>
 
-    <!-- ========== p14 世界书 ========== -->
+    <!-- ========== p14 世界设定（原「世界书」） ========== -->
     <section class=""page"" id=""p14"">
-      <h2>世界书</h2>
+      <h2>世界设定</h2>
+
+      <!-- ★ 2026-11-07：玩家主角设定（覆盖 / 新增「## 当前场景 → 对话对象」） -->
+      <div class=""sechead"">玩家主角设定</div>
+      <p class=""hint"">
+        这里的值会直接改写发给模型的「<b>## 当前场景 → 对话对象</b>」那几行——<b>不是另加一段</b>，所以不会有原文和设定打架。<br>
+        留空 = 保留游戏原文。下面四个是固定项；原文没有的（灵根 / 出身 / 年龄…）用「+ 再加一条」加。<br>
+        存盘后<b>下一轮对话生效</b>，不用重启游戏。
+      </p>
+      <div class=""row""><label>姓名</label><input id=""pfName"" type=""text"" placeholder=""留空 = 用游戏原文""></div>
+      <div class=""row""><label>性别</label><input id=""pfGender"" type=""text"" placeholder=""留空 = 用游戏原文""></div>
+      <div class=""row""><label>境界</label><input id=""pfRealm"" type=""text"" placeholder=""留空 = 用游戏原文""></div>
+      <div class=""row""><label>宗门</label><input id=""pfSect"" type=""text"" placeholder=""留空 = 用游戏原文""></div>
+      <div id=""pfExtraRows""></div>
+      <div style=""display:flex;gap:8px;align-items:center;margin:10px 0"">
+        <button class=""ghost"" onclick=""addPlayerRow()"">+ 再加一条</button>
+        <button class=""save"" onclick=""savePlayerProfile()"">保存玩家设定</button>
+        <span class=""msg"" id=""pfMsg""></span>
+      </div>
+
+      <div class=""sechead"">世界设定（世界书）</div>
 <div class=""masterswitch""><div style=""flex:1""><b>世界书注入</b><div class=""dim"">关掉后世界书条目不注入提示词。存盘即生效。</div></div><label class=""switch""><input type=""checkbox"" id=""sw-worldbookEnabled"" onchange=""saveMasterSwitch('worldbookEnabled', this.checked)""><span></span></label><span class=""msg"" id=""swmsg-worldbookEnabled""></span></div>
       <p class=""hint"">
         玩家自己写的世界设定：地名、势力、规矩、禁忌、境界……<b>多个角色共享同一套</b>。<br>
@@ -3885,6 +4198,7 @@ public static class ConsoleServer
 <div class=""masterswitch""><div style=""flex:1""><b>用角色卡取代游戏角色设定</b><div class=""dim"">开启后，游戏自带的「身份/性格/外貌/善恶/背景」那段（约 2300 字）不再注入，改用角色卡「人设」区的身份/性格/善恶立场/外貌穿着。本质是「用角色卡替代游戏原文，让你可以改游戏设定」。存盘即生效。<br>兜底规则：角色卡的人设项（姓名/身份/性格/善恶/外貌）还没抓取、或还没自动生成之前，不会删原文——新角色、还没建卡的角色都不受影响。<br>「## 角色背景」也一起删，由角色世界书「角色自身」（背景+年龄）顶上。<br>前提：卡的 姓名/身份/性格/善恶/外貌 都要有；另外<b>看游戏原文里有没有那一段</b>——原文有「## 说话习惯」才要求卡里填，原文有「## 角色背景」才要求世界书「角色自身」。原文本身没写的东西，不会因为空着就不替换。</div><div class=""dim"" style=""margin-top:4px"">不用担心「原文被删」：删的只是每次发给模型的那段提示词（临时拼的），游戏本体的角色数据 / 存档 / 对话记录都不会动；关掉这个开关，下一轮就恢复原文。</div></div><label class=""switch""><input type=""checkbox"" id=""sw-replaceOfficialProfile"" onchange=""saveMasterSwitch('replaceOfficialProfile', this.checked)""><span></span></label><span class=""msg"" id=""swmsg-replaceOfficialProfile""></span></div>
 <div class=""masterswitch""><div style=""flex:1""><b>角色卡注入</b><div class=""dim"">关掉后角色卡不注入提示词（卡还在，不会丢）。存盘即生效。</div></div><label class=""switch""><input type=""checkbox"" id=""sw-cardEnabled"" onchange=""saveMasterSwitch('cardEnabled', this.checked)""><span></span></label><span class=""msg"" id=""swmsg-cardEnabled""></span></div>
 <div class=""masterswitch""><div style=""flex:1""><b>角色世界书注入</b><div class=""dim"">关掉后角色世界书不注入提示词（条目还在）。存盘即生效。</div></div><label class=""switch""><input type=""checkbox"" id=""sw-lorebookEnabled"" onchange=""saveMasterSwitch('lorebookEnabled', this.checked)""><span></span></label><span class=""msg"" id=""swmsg-lorebookEnabled""></span></div>
+
       <p class=""hint"">
         角色卡是<b>补充层</b>：它讲的是游戏设定没写的东西（口吻、绝不说、感官标识、底线禁忌、人设原稿）。<br>
         保存后下次进对话生效。没有卡的角色不会注入任何内容。
@@ -3929,10 +4243,16 @@ public static class ConsoleServer
         <button class=""ghost"" onclick=""cleanBackup('all','','全部')"">清理全部备份</button>
         <button class=""ghost"" onclick=""doRename()"">一键改成真名</button>
         <button class=""ghost"" onclick=""cleanOldNames()"">清理旧名残留</button>
+        <button class=""ghost"" onclick=""genFromSource()"" title=""正常情况第一次跟这个角色聊天就会自动生成卡，不需要点这个；这是自动生成出问题时的兜底"">根据原文写卡（兜底）</button>
         <button class=""danger"" onclick=""deleteCard()"">删除这张卡</button>
         
         <span class=""msg"" id=""cardMsg""></span>
       </div>
+      <p class=""hint"" style=""margin-top:-2px"">
+        <b>「根据原文写卡（兜底）」</b>：读游戏原文抓下来的「角色资料」，调 AI 写一整张卡并直接保存（旧卡自动备份）。
+        <b>正常不需要点</b> —— 第一次跟角色聊天时插件会自动生成；只有自动生成没出卡、或卡是空的时候，才用它手动补一次。<br>
+        <span style=""color:#e8a05a"">⚠️ 会覆盖当前角色卡的内容（旧卡自动备份成 .重写备份_时间戳）；反过来，这个按钮也可以当成「按游戏人设重置角色卡」使用。</span>
+      </p>
       <p class=""hint"">下面是卡片的原始 JSON。字段含义见教程页；不认识的字段原样保留即可。</p>
       <details open style=""margin:10px 0"">
         <summary style=""cursor:pointer;color:var(--gold);font-size:13px"">角色资料（写卡参考，只读）</summary>
@@ -4037,7 +4357,7 @@ public static class ConsoleServer
         费用按 DeepSeek 官方【空闲时段】价估算：deepseek-flash 输入 1 元、输出 4 元（每百万 token，输入按未命中缓存算）；
         deepseek-v4-pro 约 4.5 / 13.5。<br>
         高峰时段（周一至周五 9:00-12:00、14:00-18:00）官方价翻倍，这里不自动区分；实际金额以官方账单为准。<br>
-        各功能的总开关在对应页面的顶部。改完要<b>重启游戏</b>才生效（配置启动时读一次）。
+        各功能的总开关在对应页面的顶部。在控制台里改完点保存就生效（热重载）；直接改 config.json 文件才需要重启游戏。
       </p>
     </section>
 
@@ -4072,7 +4392,7 @@ public static class ConsoleServer
       </p>
       <h3>全局设置</h3>
       <p class=""hint"" style=""line-height:1.9"">
-        · <b>回复长度</b>：旁白上限、台词上限、总上限、硬删倍数。改完<b class=""warn"">需要重启游戏</b>才生效。<br>
+        · <b>回复长度</b>：旁白上限、台词上限、总上限、硬删倍数。改完保存即生效。<br>
         · <b>情事板块</b>：auto = 关键词自动触发（推荐）；always = 每轮都注入；off = 关闭。<br>
         · <b>抽取间隔</b>：每多少轮对话自动抽取一次记忆，默认 30 轮。
       </p>
@@ -4139,7 +4459,157 @@ public static class ConsoleServer
     <!-- ========== p9 更新日志 ========== -->
     <section class=""page"" id=""p9"">
       <h2>更新日志</h2>
-      <h3>V1.2.2（当前版本）</h3>
+      <h3>V1.4.0（当前版本）</h3>
+      <p class=""hint"" style=""line-height:1.9"">
+        · <b>新增：性格面板（游戏内）</b> —— 对话框（选项框）下方出现「性格面板」按钮：<br>
+        　8 个数值随对话缓慢变化：<b>温度 / 态度 / 主动 / 话量</b>（-100~+100）+ <b>服从 / 羞耻 / 开放 / 崩坏</b>（0~100）；<br>
+        　判定走主请求内嵌 <code>""p""</code> 数组，<b>常态不增加 API 调用</b>；[按角色卡重新推断] 才花 1 次（约 500 token）。<br>
+        　面板功能：只读查看 / 16 原型模板套用 / 锁定 / 本地或 API 重新推断 / 底部缩放滑块（大小自动记住）。<br>
+        　<b>建议和角色卡一同使用</b>：本地规则推断不如 API 读角色卡准，开角色卡后点「按角色卡重新推断」更准。<br>
+        　外观可换：<code>config\panel\panel_bg.png</code>（背景图）、<code>bar_texture.png</code>（数值条纹理）。<br>
+        · <b>新增：NSFW 玩法按面板数值组装（养成模式）</b> —— 开放度五档（守礼/松动/越界/半公开/公开）<br>
+        　+ 强度类（SM / 强制 / 痛感）与崩坏类（触手 / 催眠 / 妊娠产卵乱伦 / 直播 / 肉便器化）门槛；档位跃变那一轮有过渡句。<br>
+        　「我全都要」模式保持原样（破甲原文全开）。<br>
+        · <b>新增：好感软约束</b> —— 状态块标题显示「好感 37·友善」；数值偏离好感阶段 &gt; 30 时<br>
+        　状态块加一句「别因为本轮温度高就演成老夫老妻」，游戏内面板同步显示 ⚠ 提示（不拦不 clamp）。<br>
+        · <b>新增：控制台「性格面板」卡片</b> —— 总开关 / 面板与玩法模式 / 详细记分规则（全部写明）/ 手动改数值（作弊，折叠）。<br>
+        · <b>过审模式</b>：面板的 NSFW 部分自动全部隐藏（字段说明 / 状态块 / 面板 / 控制台），prompt 里搜不到那四个词。<br>
+        · <b>新增：选项框可拖动</b> —— 对话选项框（A~D）可以按住拖动；位置自动记住（<code>optionsOffX/optionsOffY</code>），重启/换场景都保留；拖动不会误触发选项（松手时没拖动才算点击）。<br>
+        · <b>面板视觉定稿（水墨风）</b> —— 背景换成「水墨山水 + 朱日红梅 + 角花」；
+          <b>折叠/展开各配一张图</b>（<code>panel_bg.png</code> / <code>panel_bg_open.png</code>，比例不变、整图绘制不拉伸）；
+          内容区按图片固定像素定位（上 390 / 下 310 / 左右 100 图px），换更长的图内容自动适配。<br>
+        · <b>数值条重做</b> —— 底框用素材图并把<b>白色纸底抠成透明</b>（只留墨边/云纹），填充改低饱和色带；
+          右侧变动箭头 ↑/↓/─ 加粗加大。<br>
+        · <b>四轴颜色区分</b> —— 温度暖橙 / 态度紫 / 主动青绿 / 话量金黄（数值高低只调明暗，色相不变）。<br>
+        · <b>换角色即切换</b> —— 进入新角色对话时面板立刻显示新角色（不再停在老角色、聊一句才切换）。<br>
+        · <b>男角色开关</b> —— 默认不给男性 NPC 显示面板；控制台「男角色也能用面板」可开（面板文案是女性向的）。<br>
+        · <b>安装器环境检测</b> —— 不再「看到 BepInEx 就跳过」：查游戏主程序 + 框架类型，
+          BepInEx 6 保留补齐 / BepInEx 5 提示备份后覆盖 / 都没有才全新装；热修复也加了「游戏是否运行」检测。<br>
+        · <b>角色世界书「真实年龄」</b> —— 以前读配置表的开局年龄（时间过了 10 年还是 130），
+          现在 = 配置表初始年龄 + 游戏已过年数（<code>GameTime.ElapsedYears</code>），时间推进会跟着长大；<br>
+        　世界书「角色自身」条目（包括玩家手改过的）在「从关系网重新生成」时只更新年龄数字、保留其它内容；<br>
+        　日志可验证：<code>[角色世界书] 游戏时间：Year=… ElapsedYears=…</code>。<br>
+        · <b>修：全局设置保存失效</b> —— 保存函数里残留了已搬走的控件，JS 抛异常导致整页保存不生效；已修。<br>
+        · <b>去 AI 味优化（去套路 7 条）</b> —— 去套路规则重写成 7 条判据式硬规矩，放在<b>贴玩家输入</b>的位置（权重最高）：<br>
+        　① 一句只做一件事　② 结论说完就停（最像 AI 的尾巴）　③ 别给对话打分、也别报账（「这句话稳」「我认」「我记下了」这类套话）<br>
+        　④ 别像在答辩（不逐条澄清、不一口气交底、不宣誓腔）　⑤ 别用短句留白腔（「睡吧，我守着」「你去，我跟」这种网文腔）<br>
+        　⑥ 长度别匀　⑦ 台词像真人张嘴说话（允许不完整句、语气词、停顿、重复、说一半改口）。<br>
+        　反答辩 / 口语化统一并入去套路（原来分散在注入段），另新增「AI 腔密度探针」：<br>
+        　每轮输出统计「报账 / 元评价 / 比较 / 留白腔」四类套话密度并写日志 <code>[AI腔]</code>（只统计不改正文——改正文会破坏语音台本一致性）。<br>
+        · <b>默认开启</b>：<code>panelEnabled=true</code>（默认开；不想用可在控制台关掉，关掉后行为和 V1.3.5 完全一致）。<br>
+        · <b>成本</b>：字段说明 ~777 字（缓存命中）/ 状态块 ≤120 字（只在出死区时注入）/ 玩法授权只在亲密场景注入。
+      </p>
+      <h3>V1.3.5（历史）</h3>
+      <p class=""hint"" style=""line-height:1.9"">
+        · <b>新增：AI 回复语言</b> —— 控制台「全局设置」→「输出语言」，可选
+          <b>简体中文（默认）/ 繁體中文（台灣用語）/ English</b>。<br>
+        　只改 AI 说出来的文字：游戏 UI、任务、界面一概不动，历史记录也不翻译。<br>
+        　实测（真实请求）：英文指令连续 4 轮中文输入也不会漂回中文；
+        　繁体一次通过、不混简体；a1ttsv2 语音标签<code>tag</code>保持游戏词表原词。<br>
+        　<b class=""warn"">不适配语音 MOD</b>：英文/繁体下语音可能读不出或读错字，介意就关掉语音。<br>
+        · <b>成本</b>：语言指令只在需要时追加（简体模式完全不追加），
+          缓存前缀全命中，每轮只多约 160 token 未命中（tail 本来就不命中）<br>
+        · <b>默认零变化</b>：保持简体中文的玩家，行为和 1.3.4 完全一样
+      </p>
+      <h3>V1.3.4（历史）</h3>
+      <p class=""hint"" style=""line-height:1.9"">
+        · <b>修：「上下文超出模型上限」的真正根因 —— 游戏本地有一道预算闸门</b><br>
+        　游戏在发请求前，会用自己的 <code>BudgetedLlmCall</code> 做一次预算预检；
+        　它手里的字符预算是<b>写死的 24,000</b>，不随游戏设置变化。
+        　我们之前把 <code>FitChars</code> 的预算改到 60,000，但<b>改不到闸门手里的那个数</b>
+        　（Harmony 只能改被调用函数的参数，改不了调用方的局部变量）<br>
+        　→ 两处不一致：<code>FitChars</code> 看到 60,000，闸门看到 24,000<br>
+        　→ 玩家角色卡越肥、tail 越大，「固定部分」就挤占得越多<br>
+        　→ 固定部分逼近 24,000 时，连「最近 4 轮」历史都放不下<br>
+        　→ 游戏判定「凑不出合法请求」→ <b>干脆不发</b> → 弹「上下文超出模型上限」<br>
+        　现在：在闸门真正使用预算之前，把它也改成按真实上下文算的值（≤60,000）<br>
+        　实测：<code>m_MaxChars 24000 → 60000（回读=60000）</code>，连聊多轮
+        　<code>CanSend=True</code>、<code>TrimReason</code> 全空<br>
+        · <b>修：安装.bat / 热修复.bat 在含括号路径下闪退</b><br>
+        　Steam 默认装在 <code>C:\Program Files (x86)\</code>，双击安装.bat 窗口一闪就关。<br>
+        　根因：cmd 的 <code>if (...)</code> 多行块里展开 <code>%GAMEDIR%</code>，
+        　路径里的 <code>)</code> 被当成块结束 → 命令被截断。<br>
+        　修法：<code>setlocal enabledelayedexpansion</code> + 块内改用 <code>!GAMEDIR!</code><br>
+        · <b>新增：闸门诊断探针</b> —— 日志新增 <code>[闸门]</code> 行，每轮打印游戏真正使用的预算数值；
+        　以后再出现类似问题，一行日志就能看到卡在哪个数上<br>
+        · <b>玩家需要做的</b>：游戏里「上下文长度」建议 <b>≥ 64,000</b>；
+        　<b>不需要</b>改 ainpc_custom.json（max_tokens 跟这个修复无关），
+        　之前让你改 16000 的那条作废<br>
+        · 这一版<b>没有改</b>：输出契约 / 上下文档位 / 选项框 / 好感度 / 开场白 / 角色卡；
+        　发给 API 的 max_tokens 一个字节没碰
+      </p>
+      <h3>V1.3.3（历史）</h3>
+      <p class=""hint"" style=""line-height:1.9"">
+        · <b>修：「上下文超出模型上限」的另一半根因（命中率也一起修了）</b> —— 11-10 为了不再撑爆
+          <code>max_tokens</code>，把「本地裁历史的字符预算 <code>maxChars</code>」也一起关成了只读。
+          结果 <code>fixed + tail</code> 涨到 2.2 万字时，history 预算只剩 1,231 字 → 每轮从头裁
+          → 缓存断点回到第 2 条 → <b>命中率从 68% 掉到 15.6%</b>，顺带把记忆也压扁了。
+          现在改为<b>按玩家真实上下文动态算</b>：大上下文放到 60,000、小上下文自动缩，
+          <code>max_tokens</code> 依然一个字节不动<br>
+        · <b>修：长期记忆「过往总述」相邻代重复</b> —— 同一件事被记录成多代（实测 |3|=|7|=|11|）。
+          归档合并时不再把旧总述喂给模型，按设计文档「只给新对话」执行<br>
+        · <b>新增：请求大小探针</b> —— 日志每轮一行 <code>[请求] 估算 …</code>，直接列出
+          prefix / memory / context / history / tail / input 各段字数、估算 tokens、占上下文百分比，
+          快超限时标 <code>★★ 预计超限！</code>；另加 <code>[响应] ★★ 空响应</code> 警报<br>
+        · <b>实测效果</b>：命中率 15.6% → 49%（主流轮次 58~63%）、32 轮 0 次超限、占用 48~51%
+      </p>
+      <h3>V1.3.2（历史）</h3>
+      <p class=""hint"" style=""line-height:1.9"">
+        · <b>修：聊久了偶发「上下文超出模型上限，请在设置里调小上下文长度」</b> ——
+          真正原因<b>不是长度</b>。历史接管在「游戏给的历史条数 &gt; MOD 保留条数」时会认错位置
+          （拿最新的去比最老的），于是每轮都把历史当成「全新消息」：每轮重复归档几十条 +
+          每轮多触发一次后台「合并」请求；那一次合并请求和主对话抢同一个 API，
+          主对话拿到空响应（rawChars=0），游戏就把这显示成「上下文超出模型上限」。
+          现在改成「在游戏历史里定位 MOD 记住的那一段」，游戏给 20 条还是 200 条都不影响<br>
+        · <b>修：消息指纹比对</b> —— 之前模型的原始输出（带语音台本 JSON）和游戏还回来的
+          纯文本被当成两条不同消息 → 永远认不出 → 重叠=0。现在先剥 JSON 外壳、去掉空白再比<br>
+        · 这一版<b>只动历史接管的位置判断</b>，没有改任何上下文预算 / max_tokens / 输出契约<br>
+      </p>
+      <h3>V1.3.1（历史）</h3>
+      <p class=""hint"" style=""line-height:1.9"">
+        · <b>游戏 11-10 更新适配（必须更新）</b> —— 游戏更新清空了 BepInEx 的 interop 程序集，
+          首次进游戏会自动重建（约 1~2 分钟，画面卡住别急着关）<br>
+        · <b>修：自动好感度失效</b> —— 游戏把 AddIntimacy 参数从 2 个改成 3 个，旧版调用失败
+          （控制台有记录、游戏里数值不变）→ 已改为按实际参数个数调用<br>
+        · <b>修：开场白删不掉</b> —— 开场白不再固定在末条（末条可能是「## 任务：闲聊」系统消息），
+          改为按游戏自己的 IsOpening 标记识别 + 按索引删除；「下次进对话才删」的设计保留（避免 TTS 卡死）<br>
+        · <b>更新：NPC 真名表到 1685 个角色</b>（游戏更新新增 94、改名 4）<br>
+        · <b>修：选项框位置</b> —— 回到「贴输入框左边」；家园（独立场景）自动贴对话框左侧，场景切换后自动重建<br>
+        · <b>修：选项框在对话中途误消失</b> —— 不再用不可靠的面板可见性判断<br>
+        · <b>修：退出家园后选项框残留</b> —— 挂上了家园卧室面板 NpcBedroomOverlay 的 OnHide，退出即清<br>
+        · <b>修：「上下文超出模型上限，请在设置里调小上下文长度」</b> —— 旧版会改
+          ainpc_custom.json 里的 max_tokens，超过模型 API 上限就报错；现在完全不碰它<br>
+        · <b>修：日志暴涨 / 聊天卡顿</b> —— 修掉每帧刷日志和每帧全量查找<br>
+        · <b>新增：启动体检</b> —— 日志开头会打插件版本、游戏文件基线、已挂载 patch 清单、关键方法签名；
+          报告落盘 <code>存档\\BuWenFanChen\\_diag\\health_*.txt</code><br>
+        · <b>补：控制台背景图</b> —— console-bg.png 之前版本漏打进包，现在自带；
+          想换图：把图片改名 console-bg.png 放进插件目录 config 下<br>
+      </p>
+      <h3>V1.3（历史）</h3>
+      <p class=""hint"" style=""line-height:1.9"">
+        · <b>新增：上下文档位（MAX / High / Low / Off）</b> —— 三个旋钮「保留 / 裁剪 / 合并」解耦：
+          裁剪勤 → 窗口短 → 掉 JSON 少；合并稀 → 少调 LLM、少断缓存。实测掉 JSON：MAX≈3% / High≈2% / Low≈4% / Off≈11%<br>
+        · <b>改：记忆更新节拍统一跟档位走</b> —— 原来的「抽取间隔 30 轮」独立设置已停用（改只读显示），
+          由档位的「合并」数字统一管：MAX 12 / High 24 / Low 36 / Off 48 轮。一个旋钮管完记忆新鲜度<br>
+        · <b>新增：极简格式指令</b> —— tail 末尾一句 14 字「本轮输出必须是一个 JSON 对象。」，
+          实测把长 prompt 的掉 JSON 率从 60% 压到 24%（否定式指令反而会恶化到 80%，别加）<br>
+        · <b>新增：归档即合并（异步）</b> —— canon 裁掉的轮次会压进「过往总述」，原文不丢；
+          失败自动保留、下轮重试<br>
+        · <b>重写：【去套路】</b> —— 从「5 类禁用词清单」改成「四条结构硬规矩」（一句只做一件事 / 结论说完就停 / 不接四平八稳的应答 / 长度别匀）<br>
+        · <b>新增：玩家主角设定</b> —— 世界设定页可改「对话对象」的姓名/性别/境界/宗门，还能自己加条目（灵根/出身…）；留空 = 用游戏原文<br>
+        · <b>新增：自动好感度</b> —— 模型在回复里顺带给出这一轮的好感变化，程序再调游戏接口真实加减。
+          走<b>同一次 LLM 调用</b>，不额外发请求、不额外花钱、不额外等待<br>
+        · <b>新增：自动生成对话预选项</b> —— 模型在回复里多带 4 条预选回复（opts），显示在屏幕左下，点一下直接填进输入框。
+          同样走<b>同一次 LLM 调用</b>，不额外消耗<br>
+        · <b>修：角色世界书「角色自身」聊一句就失踪</b> —— 保存后归玩家所有（manual），自动抓关系不再覆盖它<br>
+        · <b>改进：骨架「过往总述」改分代</b> —— 按上下文档位的合并节拍（12 / 24 / 36 / 48 轮）批量生成，
+          每次 1~4 代（每代 ≤30 字，只写事件脉络不写描写），保留最近 10 代，旧的自动淘汰<br>
+        · <b>新增：原始输出落盘</b> —— 掉格式的原始回复写到 <code>{存档}\\BuWenFanChen\\_diag\\raw_output.jsonl</code>，方便事后排查<br>
+        · <b>修：世界书页改名「世界设定」</b>，玩家设定并进同一页<br>
+        · <b>删：补写语音台本功能整块移除</b> —— 台本库（从正文提取台词造台本）、补写、修坏、控制台开关全部删掉。
+          模型没给台本或台本解析失败，一律原样交给语音 MOD 自己处理，我们不再造字
+      </p>
+      <h3>V1.2.3</h3>
       <p class=""hint"" style=""line-height:1.9"">
         · <b>修（严重）：没装语音 MOD 的玩家，破甲/角色卡/NSFW/世界书全都不注入</b> —— 原来整个 tail 被「有没有语音 MOD」的开关包住，已拆开（tail 无条件注入，只有死命令随语音 MOD 条件加）<br>
         · <b>修：好感度判断 HTTP 404</b> —— 玩家 settings.json 的 url 只填域名时自动补 /v1/chat/completions<br>
@@ -4200,7 +4670,7 @@ public static class ConsoleServer
       <h3>修复</h3>
       <p class=""hint"" style=""line-height:1.9"">
         · 开场白：老角色历史开场白不进上下文，新角色保留并朗读<br>
-        · 补写破坏语音台本：默认关闭补写，交给语音 MOD 自己处理<br>
+        · 补写语音台本功能<b>整块移除</b>（台本库/补写/修坏/开关全部删掉），台本完全交给语音 MOD 处理<br>
         · 游戏更新后 REPLACE 失配：启动日志打印命中条数，一眼看出异常<br>
         · 名字带数字后缀：提示词明确那不是名字的一部分<br>
         · 记忆越玩越长：老化 + 注入上限双重控制
@@ -4215,44 +4685,29 @@ public static class ConsoleServer
     </section>
 
   <section class=""page"" id=""p16"">
-      <h2>自动好感度 <span class=""warn"">测试功能</span></h2>
+      <h2>DIY自动化</h2>
       <p class=""hint"" style=""line-height:1.8"">
-        每轮对话后，单独调一次 API 判断「这一轮玩家的言行对角色好感的影响」，再调游戏接口真实加减好感。<br>
-        <b class=""warn"">多花多少：</b>每轮多一次 API 调用，约 <b>1000~1300 token 输入 + 十几 token 输出</b>，
-        按 deepseek-flash 空闲价约 <b>每轮 ¥0.01 左右</b>（高峰期翻倍）。
+        这一页都是「让模型在正常回复里顺手多做一点事」的开关。<br>
+        所有功能都走<b>同一次 LLM 调用</b>——不额外发请求、不额外花钱、不额外等待。
       </p>
 
-      <div class=""masterswitch""><div style=""flex:1""><b>启用自动好感度</b><div class=""dim"">关掉后完全不调用、不加减。存盘即生效。</div></div><label class=""switch""><input type=""checkbox"" id=""sw-autoIntimacyEnabled"" onchange=""saveMasterSwitch('autoIntimacyEnabled', this.checked)""><span></span></label><span class=""msg"" id=""swmsg-autoIntimacyEnabled""></span></div>
+      <div class=""masterswitch"" style=""margin-top:10px""><div style=""flex:1""><b>自动生成对话预选项</b><div class=""dim"">模型在回复里多带 4 条预选回复（opts），显示在屏幕左下，点一下直接填进输入框。关掉则不要求、也不显示。存盘即生效。</div></div><label class=""switch""><input type=""checkbox"" id=""sw-optionsEnabled"" onchange=""saveMasterSwitch('optionsEnabled', this.checked)""><span></span></label><span class=""msg"" id=""swmsg-optionsEnabled""></span></div>
 
-      <div class=""row"" style=""margin-top:12px""><label>生效方式</label>
-        <select id=""autoIntimacyMode"">
-          <option value=""async"">异步（迟一轮生效，不影响回复速度）</option>
-          <option value=""sync"">同步（当前轮立即生效，退出对话前最后一轮不生效）</option>
-        </select>
-      </div>
-      <p class=""hint"" style=""margin-top:-4px"">异步：聊下一句时才把上一轮的好感加上，不影响回复速度；<b class=""warn"">同步：每轮回复整体会迟约 2 秒</b>。</p>
+      <div class=""masterswitch"" style=""margin-top:10px""><div style=""flex:1""><b>自动好感度</b><div class=""dim"">模型在回复里顺带给出这一轮的好感变化，我们再调游戏接口真实加减。关掉则完全不加减。存盘即生效。</div></div><label class=""switch""><input type=""checkbox"" id=""sw-autoIntimacyEnabled"" onchange=""saveMasterSwitch('autoIntimacyEnabled', this.checked)""><span></span></label><span class=""msg"" id=""swmsg-autoIntimacyEnabled""></span></div>
 
-      <div style=""margin-top:14px""><b style=""color:var(--gold);font-size:13px"">好感度规则（改数字就行）</b>
-        <div class=""row"" style=""margin-top:8px""><label>正面最多加</label><input id=""autoIntimacyMaxUp"" type=""number"" min=""1"" max=""20"" step=""1"" style=""width:90px""><span style=""color:var(--dim)"">点（+1 ~ +N）</span></div>
-        <div class=""row""><label>负面最多扣</label><input id=""autoIntimacyMaxDown"" type=""number"" min=""1"" max=""20"" step=""1"" style=""width:90px""><span style=""color:var(--dim)"">点（-1 ~ -N）</span></div>
-        <div class=""row"" style=""margin-top:6px""><label>加分行为</label><input id=""autoIntimacyPositive"" style=""flex:1""></div>
-        <div class=""row""><label>扣分行为</label><input id=""autoIntimacyNegative"" style=""flex:1""></div>
-        <p class=""hint"">「普通日常 / 闲聊 / 无关痛痒 = 0」是固定的，不用改。</p>
+      <div style=""margin-top:16px""><b style=""color:var(--gold);font-size:13px"">好感度范围</b>
+        <div class=""row"" style=""margin-top:8px""><label>正面最多加</label><input id=""autoIntimacyMaxUp"" type=""number"" min=""1"" max=""20"" step=""1"" style=""width:90px""><span style=""color:var(--dim)"">点</span></div>
+        <div class=""row""><label>负面最多扣</label><input id=""autoIntimacyMaxDown"" type=""number"" min=""1"" max=""20"" step=""1"" style=""width:90px""><span style=""color:var(--dim)"">点</span></div>
+        <p class=""hint"">模型自己按 -3 ~ +3 给，这里只是兜底上限：超出会被夹住。</p>
       </div>
 
-      <div style=""margin-top:14px""><b style=""color:var(--gold);font-size:13px"">判断模型（可选）</b>
-        <div class=""row"" style=""margin-top:6px""><label>API 地址</label><input id=""autoIntimacyApiUrl"" style=""flex:1"" placeholder=""留空 = 用主对话 API；本地填 http://localhost:11434/v1/chat/completions""></div>
-        <div class=""row""><label>API 密钥</label><input id=""autoIntimacyApiKey"" style=""flex:1"" placeholder=""本地模型留空即可；填别家云 API 时填 sk-…""></div>
-        <div class=""row""><label>模型名</label><input id=""autoIntimacyModel"" style=""flex:1"" placeholder=""留空 = qwen2.5:0.5b""></div>
-        <p class=""hint"">两种都行：<b>本地 Ollama</b>（0 元，CPU 能跑）或<b>别的云 API</b>（填地址 + 密钥 + 模型名）。都留空就沿用主对话那套。详见「教程」页。</p>
-      </div>
       <div style=""margin:10px 0"">
         <button class=""save"" onclick=""saveAutoIntimacy()"">保存</button>
         <span class=""msg"" id=""autoIntimacyMsg""></span>
       </div>
       <div class=""refresh-tip"" style=""margin-top:16px"">
-        ⚠ 测试功能：每轮对话会额外调用一次 API 判断好感（约 1000~1300 token，¥0.01 左右/轮）。
-        异步模式不影响回复速度；<b>同步模式每轮回复整体会迟约 2 秒</b>，且退出对话前最后一轮不生效。
+        ✔ 这两项都跟着主对话一起产出——<b>不额外调用 API、不额外花钱</b>。
+        想省钱就把它们关掉，回复速度不会有任何变化。
       </div>
 
       <h3 style=""margin-top:22px"">本次统计 <span id=""aiStatNpc"" class=""hint""></span></h3>
@@ -4265,6 +4720,62 @@ public static class ConsoleServer
         </tr></thead>
         <tbody></tbody>
       </table>
+
+      <div class=""masterswitch"" style=""margin-top:22px""><div style=""flex:1""><b>性格面板</b><div class=""dim"">开启后游戏里<b>对话框（选项框）下方</b>出现「性格面板」按钮：8 个会随对话缓慢变化的数值（温度/态度/主动/话量 + 服从/羞耻/开放/崩坏）。<br>游戏内面板<b>只读</b>（看状态 / 套模板 / 锁定），手动调值在下面「手动改数值（作弊）」；只影响提示词表达，<b>不改游戏存档</b>；过审模式开着时 NSFW 部分自动隐藏。存盘即生效。<br><b>建议和角色卡一同使用</b>：本地规则推断不如 API 读角色卡准——开了角色卡后点面板里的「按角色卡重新推断」更准确（花 1 次 API）。</div></div><label class=""switch""><input type=""checkbox"" id=""sw-panelEnabled"" onchange=""saveMasterSwitch('panelEnabled', this.checked)""><span></span></label><span class=""msg"" id=""swmsg-panelEnabled""></span></div>
+
+      <div class=""row"" style=""margin-top:6px""><label>面板与玩法</label>
+        <select id=""panelNsfwModeSel"" style=""flex:1"" onchange=""savePanelMode()"">
+          <option value=""growth"">养成模式（面板数值 &gt; NSFW 模块 · 推荐）</option>
+          <option value=""allopen"">我全都要！（NSFW 模块 &gt; 面板数值）</option>
+        </select>
+        <span class=""msg"" id=""panelModeMsg""></span>
+      </div>
+      <p class=""hint"">养成模式：她的开放度/服从度/崩坏度决定能演哪些玩法，慢慢养（面板数值直接组装「允许/禁止」，剥掉破甲里的原【玩法授权】段）；我全都要：任何玩法都不会被拒绝，面板只做状态显示。</p>
+      <div class=""masterswitch"" style=""margin-top:8px""><div style=""flex:1""><b>男角色也能用面板</b><div class=""dim"">默认关：男角色也能看面板数值（数值是通用的），但默认<b>不把面板写进 prompt</b>（面板状态块是女性向文案，套男角色会出戏）。开了 = 男角色也参与数值判定和注入。存盘即生效。</div></div><label class=""switch""><input type=""checkbox"" id=""sw-panelForMale"" onchange=""savePanelForMale(this.checked)""><span></span></label><span class=""msg"" id=""panelMaleMsg""></span></div>
+      <details style=""margin:10px 0"">
+        <summary style=""cursor:pointer;color:var(--gold);font-size:13px"">📖 记分规则（点击展开 · 全写在这儿，不用猜）</summary>
+        <div style=""line-height:1.9;font-size:13px"">
+          <b>一、八个数值是什么</b><br>
+          · <b>温度</b>（-100~+100）：她的情绪热度。话题热烈、被撩、吵架 → 上升；冷淡、被敷衍 → 下降。<br>
+          · <b>态度</b>（-100~+100）：对你的好感倾向。夸她、顺着她说 → 上升；冒犯、命令她 → 下降。<br>
+          · <b>主动</b>（-100~+100）：她主动找话、贴近你的倾向。气氛好、被鼓励 → 上升。<br>
+          · <b>话量</b>（-100~+100）：一次回复的长短倾向。聊得投入 → 上升；敷衍 → 下降。<br>
+          · <b>服从</b>（0~100）：亲密场合听不听话。<br>
+          · <b>羞耻</b>（0~100）：害羞程度（越高越放得开）。<br>
+          · <b>开放</b>（0~100）：对更「过线」玩法的接受度。<br>
+          · <b>崩坏</b>（0~100）：理智崩坏程度（最难涨）。<br>
+          <b>二、怎么变</b><br>
+          · 每轮由 AI 按对话内容判定：四轴单轮最多 ±1（强烈事件 ±2）；服从/羞耻/开放/崩坏单轮 ±1（崩坏只 +1）。<br>
+          · <b>死区</b>：四轴在 -7 ~ +7 之间时数值照常记，但不写进提示词（不影响演出）。<br>
+          · <b>冷却</b>：同一轴连续 3 轮都在变 → 强制停 2 轮，防止一路飙到底。<br>
+          · <b>衰减</b>：四轴每 8 轮向 0 回落 1 点；服从/羞耻每 15 个空闲轮、开放每 20、崩坏每 30 向「基准值」回落 1 点（基准 = 角色卡初值，不会被抹掉）。<br>
+          · 后四项只有亲密场景才动；一直亲密不衰减，久不亲密才慢慢回落。<br>
+          <b>三、玩法开放条件（养成模式）</b><br>
+          · 私下常规：默认可用。<br>
+          · 半褪 / 蒙眼 / 轻微束缚：开放 ≥ 21。<br>
+          · 露出（窗边、半掩）：开放 ≥ 41。<br>
+          · 半公开（野外、隔墙有人）：开放 ≥ 61。<br>
+          · 公开场合 / 故意展示：开放 ≥ 81。<br>
+          · SM / 轻度调教：开放 ≥ 21 且 服从 ≥ 40。<br>
+          · 强制 / 命令式：开放 ≥ 41 且 服从 ≥ 60。<br>
+          · 痛感 / 惩罚向：开放 ≥ 61 且 服从 ≥ 70。<br>
+          · 触手 / 催眠（崩坏类）：开放 ≥ 41 且 崩坏 ≥ 30。<br>
+          · 肉便器化 / 精神崩坏：开放 ≥ 81 且 崩坏 ≥ 60。<br>
+          <b>四、其它</b><br>
+          · 16 个原型（天然呆/腹黑/傲娇…）只是参照模板，不限制数值；「套用」可一键把数值设成该原型的基准。<br>
+          · <b>锁定</b>后数值不再自动变化（只能手动改）。<br>
+          · 过审模式开着时：NSFW 四项既不显示也不注入提示词。<br>
+          · 数值只影响 AI 的表达倾向，<b>不改游戏存档里的任何数据</b>；重启游戏数值保留（存在存档目录），「重置本角色」可清回角色卡初值。
+        </div>
+      </details>
+
+      <details style=""margin:16px 0"">
+        <summary style=""cursor:pointer;color:var(--gold);font-size:13px"">🔧 手动改数值（作弊 · 点击展开）</summary>
+        <p class=""hint"" style=""margin-top:8px;font-size:13px"">游戏内面板只读，<b>调数值在这里拖</b>。只影响提示词表达，<b>不改游戏存档</b>；拖动即保存，面板关着也能调（下次开面板生效）。<br>
+        彩色条 = 当前值（填充越长数值越高），拖动条上的滑块即可调整。</p>
+        <div id=""panelCheatRows""><div class=""hint"">加载中…</div></div>
+        <div style=""margin-top:8px""><button class=""save"" onclick=""panelCheatReload()"">刷新</button><span class=""msg"" id=""panelCheatMsg""></span></div>
+      </details>
   </section>
 
   <section class=""page"" id=""p15"">
@@ -4450,12 +4961,8 @@ async function loadTokens() {
         : '<span style=""color:var(--red)"">关</span>';
       h += '<tr><td>' + esc(it.name) + '</td><td>' + it.chars + '</td><td>' + st + '</td><td style=""color:var(--dim)"">' + esc(it.note) + '</td></tr>';
     });
-    if (o.extraCall && o.extraCall.enabled) {
-      const ecost = o.extraCall.local ? '本地模型（0 元）' : ('约 ¥' + Number(o.extraCall.cost).toFixed(4));
-      h += '<tr><td>自动好感度（额外调用）</td><td>+' + o.extraCall.inTokens + ' tok</td>'
-        + '<td><span style=""color:var(--jade)"">开</span></td>'
-        + '<td style=""color:var(--dim)"">每轮额外调用，' + ecost + '</td></tr>';
-    }
+    // ★ 2026-11-06：自动好感度已并入主请求（同一次 LLM 调用），
+    //   不再有「额外调用」这一项，Token 预览里对应那行删掉了。
     tb.innerHTML = h;
   } catch (e) {}
 }
@@ -4552,7 +5059,7 @@ async function loadMasterSwitches() {
   try {
     const r = await fetch('/api/config');
     const c = await r.json();
-    ['memoryEnabled','worldbookEnabled','lorebookEnabled','nsfwEnabled','cardEnabled','replaceOfficialProfile'].forEach(k => {
+    ['memoryEnabled','worldbookEnabled','lorebookEnabled','nsfwEnabled','cardEnabled','replaceOfficialProfile','fallbackEnabled','optionsEnabled'].forEach(k => {
       const el = document.getElementById('sw-' + k);
       if (el) el.checked = c[k] !== false;
     });
@@ -4566,8 +5073,108 @@ async function saveMasterSwitch(key, on) {
     c[key] = on;
     const r = await fetch('/api/config', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(c) });
     const o = await r.json();
-    if (m) { m.className = 'msg ' + (o.ok ? 'ok' : 'bad'); m.textContent = o.ok ? '已保存（重启生效）' : (o.msg || '失败'); }
+    if (m) { m.className = 'msg ' + (o.ok ? 'ok' : 'bad'); m.textContent = o.ok ? (key === 'hideNsfw' ? '已保存，刷新中…' : '已保存（已生效）') : (o.msg || '失败'); }
+    // 2026-11-09 过审模式：页面需要刷新才会重新渲染（隐藏 NSFW 页）
+    if (o.ok && key === 'hideNsfw') { setTimeout(function(){ location.reload(); }, 600); }
   } catch (e) { if (m) { m.className='msg bad'; m.textContent='请求失败：' + e.message; } }
+}
+
+// ===== 数值面板：载入 / 保存模式 =====
+async function loadPanelMode() {
+  try {
+    const r = await fetch('/api/config');
+    const c = await r.json();
+    const sel = document.getElementById('panelNsfwModeSel');
+    if (sel) sel.value = c.panelNsfwMode || 'growth';
+    const sw = document.getElementById('sw-panelEnabled');
+    if (sw) sw.checked = c.panelEnabled !== false;
+    const gm = document.getElementById('sw-panelForMale');
+    if (gm) gm.checked = !!c.panelForMale;
+  } catch (e) {}
+}
+async function savePanelForMale(on) {
+  const m = document.getElementById('panelMaleMsg');
+  try {
+    const r0 = await fetch('/api/config');
+    const c = await r0.json();
+    c.panelForMale = on;
+    const r = await fetch('/api/config', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(c) });
+    const o = await r.json();
+    if (m) { m.className = 'msg ' + (o.ok ? 'ok' : 'bad'); m.textContent = o.ok ? '已保存（已生效）' : (o.msg || '失败'); }
+  } catch (e) { if (m) { m.className='msg bad'; m.textContent='请求失败：' + e.message; } }
+}
+async function savePanelMode() {
+  const m = document.getElementById('panelModeMsg');
+  try {
+    const r0 = await fetch('/api/config');
+    const c = await r0.json();
+    const sel = document.getElementById('panelNsfwModeSel');
+    if (sel) c.panelNsfwMode = sel.value;
+    const r = await fetch('/api/config', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(c) });
+    const o = await r.json();
+    if (m) { m.className = 'msg ' + (o.ok ? 'ok' : 'bad'); m.textContent = o.ok ? '已保存（已生效）' : (o.msg || '失败'); }
+  } catch (e) { if (m) { m.className='msg bad'; m.textContent='请求失败：' + e.message; } }
+}
+
+// ===== 手动改数值（作弊）：彩色条 + 拖动 =====
+const PANEL_AXES = [
+  { k:'warm',       n:'温度', min:-100, max:100, c:'linear-gradient(90deg,#7a3f22,#ff8c4d)' },
+  { k:'attitude',   n:'态度', min:-100, max:100, c:'linear-gradient(90deg,#4a3f7a,#b794ff)' },
+  { k:'initiative', n:'主动', min:-100, max:100, c:'linear-gradient(90deg,#1f5a4a,#61e0b8)' },
+  { k:'verbose',    n:'话量', min:-100, max:100, c:'linear-gradient(90deg,#6a5a1f,#f2d861)' },
+  { k:'submission', n:'服从', min:0,    max:100, c:'linear-gradient(90deg,#274a7a,#6ba6ff)' },
+  { k:'shame',      n:'羞耻', min:0,    max:100, c:'linear-gradient(90deg,#7a2a45,#ff94bd)' },
+  { k:'openness',   n:'开放', min:0,    max:100, c:'linear-gradient(90deg,#5a2a7a,#e08cff)' },
+  { k:'corruption', n:'崩坏', min:0,    max:100, c:'linear-gradient(90deg,#5a1a1a,#d95252)' }
+];
+let panelState = null;
+async function panelCheatReload() {
+  const box = document.getElementById('panelCheatRows');
+  const m = document.getElementById('panelCheatMsg');
+  if (!box) return;
+  try {
+    const r = await fetch('/api/panel');
+    const o = await r.json();
+    if (!o.ok) { box.innerHTML = '<div class=""hint"">' + (o.msg || '还没有面板数据') + '</div>'; return; }
+    panelState = o;
+    drawPanelCheat();
+    if (m) { m.className = 'msg ok'; m.textContent = '（' + (o.npcName || o.npcId) + '）'; }
+  } catch (e) { if (m) { m.className = 'msg bad'; m.textContent = '请求失败：' + e.message; } }
+}
+function drawPanelCheat() {
+  const box = document.getElementById('panelCheatRows');
+  if (!box || !panelState) return;
+  const v = panelState.values || [];
+  const n = panelState.hideNsfw ? 4 : 8;   // 过审模式：NSFW 四条不画
+  let h = '';
+  for (let i = 0; i < n; i++) {
+    const a = PANEL_AXES[i];
+    const val = v[i] || 0;
+    const pct = Math.max(0, Math.min(100, (val - a.min) / (a.max - a.min) * 100));
+    h += '<div style=""display:flex;align-items:center;gap:8px;margin:5px 0"">'
+      + '<span style=""width:34px;color:var(--txt);font-size:12px"">' + a.n + '</span>'
+      + '<div style=""flex:1;position:relative;height:20px;background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.12);border-radius:10px"">'
+      + '<div id=""pvfill-' + i + '"" style=""position:absolute;top:1px;bottom:1px;left:1px;width:calc(' + pct + '% - 2px);background:' + a.c + ';border-radius:9px""></div>'
+      + '<input type=""range"" id=""pv-' + i + '"" min=""' + a.min + '"" max=""' + a.max + '"" value=""' + val + '"" style=""position:absolute;left:0;top:0;width:100%;height:100%;opacity:0;cursor:pointer"" oninput=""panelCheatInput(' + i + ', this.value)"" onchange=""panelCheatSave(' + i + ', this.value)"">'
+      + '</div>'
+      + '<span id=""pvval-' + i + '"" style=""width:40px;text-align:right;color:var(--gold);font-size:12px"">' + (val > 0 && i < 4 ? '+' : '') + val + '</span>'
+      + '</div>';
+  }
+  box.innerHTML = h;
+}
+function panelCheatInput(i, v) {
+  const a = PANEL_AXES[i];
+  const pct = Math.max(0, Math.min(100, (v - a.min) / (a.max - a.min) * 100));
+  const f = document.getElementById('pvfill-' + i);
+  if (f) f.style.width = 'calc(' + pct + '% - 2px)';
+  const nEl = document.getElementById('pvval-' + i);
+  if (nEl) nEl.textContent = (v > 0 && i < 4 ? '+' : '') + v;
+}
+async function panelCheatSave(i, v) {
+  try {
+    await fetch('/api/panel', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ action:'set', axis:i, value:+v }) });
+    if (panelState) panelState.values[i] = +v;
+  } catch (e) {}
 }
 
 // ===== 导航 =====
@@ -4585,6 +5192,8 @@ document.querySelectorAll('#nav button').forEach(b => {
     if (b.dataset.p === 'p5') loadMemLimit();
     if (b.dataset.p === 'p7') renderPvScenes();
     if (b.dataset.p === 'p16') loadAutoIntimacy();
+    if (b.dataset.p === 'p16') loadPanelMode();
+    if (b.dataset.p === 'p16') panelCheatReload();
   };
 });
 // 延迟到所有定义都完成后执行（避免 const 的 TDZ 报错让整个 script 挂掉）
@@ -4594,6 +5203,20 @@ window.addEventListener('load', function () {
 });
 
 // ===== 配置读写 =====
+// ★ 2026-11-07：上下文档位预设 [保留轮数, 裁剪节拍, 合并节拍]
+//   MAX 的卖点是「记忆最新鲜」（合并 8 轮一次），不是「失败率最低」——实测加指令后 High/Low 的失败率并不比它差
+const CANON_TIERS = { max: [8, 4, 8], high: [10, 6, 24], low: [15, 8, 36], off: [20, 10, 48] };
+function updateCanonHint() {
+  const sel = document.getElementById('canonTier');
+  const el = document.getElementById('canonTierHint');
+  if (!sel || !el) return;
+  const t = CANON_TIERS[sel.value] || CANON_TIERS.high;
+  el.innerHTML = '当前：<b>' + sel.value.toUpperCase() + '</b> · 保留 ' + t[0] + ' 轮 · 每 ' +
+    t[1] + ' 轮裁剪一次 · 每 ' + t[2] + ' 轮合并一次 · 窗口 ' + t[0] + '~' + (t[0] + t[1] - 1) + ' 轮';
+  // ★ 2026-11-07：记忆更新节拍跟档位走，只读框同步显示
+  const ei = document.getElementById('extractInterval');
+  if (ei) ei.value = t[2];
+}
 async function loadConfig() {
   const r = await fetch('/api/config');
   const c = await r.json();
@@ -4604,8 +5227,23 @@ async function loadConfig() {
   set('replyLenLo', c.replyLenLo ?? 0);
   set('replyLenHardRatio', c.replyLenHardRatio ?? 2.0);
   set('nsfwMode', c.nsfwMode ?? 'auto');
+  set('outputLanguage', c.outputLanguage ?? 'zh-CN');
+  set('panelEnabled', String(c.panelEnabled ?? false));
+  set('panelNsfwMode', c.panelNsfwMode ?? 'growth');
   set('nsfwLatch', c.nsfwLatch ?? 5);
-  set('extractInterval', c.extractInterval ?? 30);
+  set('extractInterval', c.canonMergeEvery ?? 24);   // ★ 跟档位走（只读显示，实际值 = canonMergeEvery）
+  // ★ 2026-11-07：上下文档位（保留 / 裁剪 / 合并），下拉只给四档预设
+  const _ck = +(c.canonKeepRounds ?? 10), _ce = +(c.canonArchiveEvery ?? 6);
+  const _tierSel = document.getElementById('canonTier');
+  if (_tierSel) {
+    let _t = '';
+    for (const k in CANON_TIERS) {
+      if (CANON_TIERS[k][0] === _ck && CANON_TIERS[k][1] === _ce) { _t = k; break; }
+    }
+    if (!_t) _t = (_ck <= 8 ? 'max' : _ck <= 10 ? 'high' : _ck <= 15 ? 'low' : 'off');
+    _tierSel.value = _t;
+    updateCanonHint();
+  }
   const cbAct = document.getElementById('allowNpcActing');
   if (cbAct) cbAct.checked = !!c.allowNpcActing;
   set('cardEnabled', String(c.cardEnabled ?? true));
@@ -4617,8 +5255,24 @@ async function loadConfig() {
   set('consoleAutoOpen', String(c.consoleAutoOpen ?? true));
   document.getElementById('statTotal').textContent = c.replyLenTotal ?? 200;
   document.getElementById('statNsfw').textContent = c.nsfwMode ?? 'auto';
-  document.getElementById('statFallback').textContent = (c.fallbackEnabled ? '开' : '关');
-  document.getElementById('statExtract').textContent = c.extractInterval ?? 30;
+  document.getElementById('statExtract').textContent = c.canonMergeEvery ?? 24;
+  // ★ 2026-11-09 过审模式：隐藏 NSFW 导航按钮与页面
+  if (c.hideNsfw) {
+    const nb = document.querySelector('[data-p=""p10""]');
+    if (nb && nb.parentNode) nb.parentNode.removeChild(nb);
+    const ns = document.getElementById('p10');
+    if (ns && ns.parentNode) ns.parentNode.removeChild(ns);
+  }
+  // ★ 2026-11-09：过审模式开关初始状态
+  const swHn = document.getElementById('sw-hideNsfw');
+  if (swHn) swHn.checked = !!c.hideNsfw;
+  // ★ 2026-11-14 主人反馈「切页面后性格面板开关自动关」：这两个开关以前只在点某个按钮时才回显，
+  //   页面初始化/切换时没有回显 → checkbox 回到默认未勾选，看起来像「自己关了」。这里补初始化回显。
+  const swPnl = document.getElementById('sw-panelEnabled');
+  if (swPnl) swPnl.checked = c.panelEnabled !== false;
+  const swMale = document.getElementById('sw-panelForMale');
+  if (swMale) swMale.checked = c.panelForMale === true;
+  loadPlayerProfile(c);
   calcSeconds();
   loadStatus();
 }
@@ -4657,7 +5311,12 @@ async function loadStatus() {
   } catch (e) {}
 }
 async function saveSettings() {
-  const g = id => document.getElementById(id).value;
+  // ★ 2026-11-13 修复：本页已经不放「性格面板」控件（移到 DIY 自动化页了），
+  //   旧代码直接 g('panelEnabled') / g('panelNsfwMode') 会拿到 null → .value 抛异常
+  //   → 保存请求根本没发出去（表现就是「全局设置保存失效」）。
+  //   现在：找不到的控件不提交（后端保留原值），其余字段照常保存。
+  const el = id => document.getElementById(id);
+  const g = id => { const e = el(id); return e ? e.value : null; };
   const body = {
     replyLenNarration: +g('replyLenNarration'),
     replyLenDialogue: +g('replyLenDialogue'),
@@ -4665,8 +5324,12 @@ async function saveSettings() {
     replyLenLo: +g('replyLenLo'),
     replyLenHardRatio: +g('replyLenHardRatio'),
     nsfwMode: g('nsfwMode'),
+    outputLanguage: g('outputLanguage'),
     nsfwLatch: +g('nsfwLatch'),
     extractInterval: +g('extractInterval'),
+    canonKeepRounds: (CANON_TIERS[g('canonTier')] || CANON_TIERS.high)[0],
+    canonArchiveEvery: (CANON_TIERS[g('canonTier')] || CANON_TIERS.high)[1],
+    canonMergeEvery: (CANON_TIERS[g('canonTier')] || CANON_TIERS.high)[2],
     allowNpcActing: !!(document.getElementById('allowNpcActing') || {}).checked,
     cardEnabled: g('cardEnabled') === 'true',
     cardModel: g('cardModel') || '',
@@ -4676,11 +5339,77 @@ async function saveSettings() {
     dumpEnabled: g('dumpEnabled') === 'true',
     consoleAutoOpen: g('consoleAutoOpen') === 'true',
   };
+  if (el('panelEnabled')) body.panelEnabled = g('panelEnabled') === 'true';
+  if (el('panelNsfwMode')) body.panelNsfwMode = g('panelNsfwMode');
   const r = await fetch('/api/config', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
   const o = await r.json();
   const m = document.getElementById('settingsMsg');
-  if (o.ok) { m.className = 'msg ok'; m.textContent = '已保存，重启游戏后生效'; }
+  if (o.ok) { m.className = 'msg ok'; m.textContent = '已保存（已生效）'; }
   else { m.className = 'msg bad'; m.textContent = '保存失败：' + (o.error || '未知'); }
+}
+
+// ===== ★ 2026-11-07：玩家主角设定（覆盖/新增「## 当前场景 → 对话对象」）=====
+function addPlayerRow(k, v) {
+  const box = document.getElementById('pfExtraRows');
+  if (!box) return;
+  const row = document.createElement('div');
+  row.className = 'row';
+  row.style.cssText = 'display:flex;gap:8px;align-items:center;margin-top:6px';
+  const ki = document.createElement('input');
+  ki.type = 'text'; ki.className = 'pfK'; ki.placeholder = '键（如 灵根）';
+  ki.style.maxWidth = '130px'; ki.value = k || '';
+  const vi = document.createElement('input');
+  vi.type = 'text'; vi.className = 'pfV'; vi.placeholder = '值（如 火单）';
+  vi.style.flex = '1'; vi.value = v || '';
+  const del = document.createElement('button');
+  del.className = 'ghost'; del.textContent = '×'; del.title = '删掉这条';
+  del.onclick = function () { row.remove(); };
+  row.appendChild(ki); row.appendChild(vi); row.appendChild(del);
+  box.appendChild(row);
+}
+function loadPlayerProfile(c) {
+  c = c || {};
+  const set = (id, v) => { const e = document.getElementById(id); if (e) e.value = v || ''; };
+  set('pfName', c.playerName);
+  set('pfGender', c.playerGender);
+  set('pfRealm', c.playerRealm);
+  set('pfSect', c.playerSect);
+  const box = document.getElementById('pfExtraRows');
+  if (!box) return;
+  box.innerHTML = '';
+  (c.playerExtra || '').split('\\n').forEach(line => {
+    line = line.trim();
+    if (!line) return;
+    let i = line.indexOf('：'); if (i < 0) i = line.indexOf(':');
+    if (i <= 0) return;
+    addPlayerRow(line.slice(0, i).trim(), line.slice(i + 1).trim());
+  });
+}
+async function savePlayerProfile() {
+  const g = id => ((document.getElementById(id) || {}).value || '').trim();
+  const extra = [];
+  document.querySelectorAll('#pfExtraRows .row').forEach(r => {
+    const k = ((r.querySelector('.pfK') || {}).value || '').trim();
+    const v = ((r.querySelector('.pfV') || {}).value || '').trim();
+    if (k && v) extra.push(k + '：' + v);
+  });
+  const body = {
+    playerName: g('pfName'),
+    playerGender: g('pfGender'),
+    playerRealm: g('pfRealm'),
+    playerSect: g('pfSect'),
+    playerExtra: extra.join('\\n'),
+  };
+  const m = document.getElementById('pfMsg');
+  const r = await fetch('/api/config', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  const o = await r.json().catch(() => ({}));
+  if (o.ok) {
+    m.className = 'msg ok';
+    m.textContent = '已保存 · 下一轮对话生效' + (extra.length ? '（自定义 ' + extra.length + ' 条）' : '');
+  } else {
+    m.className = 'msg bad';
+    m.textContent = '保存失败：' + (o.error || '未知');
+  }
 }
 
 // ===== 自动好感度 =====
@@ -4690,22 +5419,13 @@ async function loadAutoIntimacy() {
     const c = await r.json();
     const sw = document.getElementById('sw-autoIntimacyEnabled');
     if (sw) sw.checked = c.autoIntimacyEnabled === true;
-    const mode = document.getElementById('autoIntimacyMode');
-    if (mode) mode.value = (c.autoIntimacyMode === 'sync') ? 'sync' : 'async';
     const up = document.getElementById('autoIntimacyMaxUp');
     if (up) up.value = (c.autoIntimacyMaxUp != null ? c.autoIntimacyMaxUp : 5);
     const down = document.getElementById('autoIntimacyMaxDown');
     if (down) down.value = (c.autoIntimacyMaxDown != null ? c.autoIntimacyMaxDown : 3);
-    const pos = document.getElementById('autoIntimacyPositive');
-    if (pos) pos.value = c.autoIntimacyPositive || '真诚关心、体贴、说到她心里、共同经历、送她喜欢的东西';
-    const neg = document.getElementById('autoIntimacyNegative');
-    if (neg) neg.value = c.autoIntimacyNegative || '冒犯、轻慢、欺骗、触到她的底线、无视她的感受';
-    const apiUrl = document.getElementById('autoIntimacyApiUrl');
-    if (apiUrl) apiUrl.value = c.autoIntimacyApiUrl || '';
-    const apiKey = document.getElementById('autoIntimacyApiKey');
-    if (apiKey) apiKey.value = c.autoIntimacyApiKey || '';
-    const mdl = document.getElementById('autoIntimacyModel');
-    if (mdl) mdl.value = c.autoIntimacyModel || '';
+    // ★ 2026-11-07：本页的另一个开关「自动生成对话预选项」从长期记忆页搬来，
+    //   它的初始值由主开关统一加载（loadMasterSwitches），这里不用重复处理。
+    //   （上下文保留档位已移到「全局设置 → 记忆与其它」）
     loadIntimacyStats();
   } catch (e) { console.error('loadAutoIntimacy', e); }
 }
@@ -4730,16 +5450,13 @@ async function loadIntimacyStats() {
 }
 async function saveAutoIntimacy() {
   const m = document.getElementById('autoIntimacyMsg');
+  // ★ 2026-11-06：只保留「好感度范围」两个数字。
+  //   生效方式 / 加分扣分行为 / 判断模型 API 三项已随「并入主请求」一起删掉。
   const body = {
-    autoIntimacyMode: document.getElementById('autoIntimacyMode').value,
     autoIntimacyMaxUp: parseInt(document.getElementById('autoIntimacyMaxUp').value, 10) || 5,
     autoIntimacyMaxDown: parseInt(document.getElementById('autoIntimacyMaxDown').value, 10) || 3,
-    autoIntimacyPositive: document.getElementById('autoIntimacyPositive').value,
-    autoIntimacyNegative: document.getElementById('autoIntimacyNegative').value,
-    autoIntimacyApiUrl: (document.getElementById('autoIntimacyApiUrl').value || '').trim(),
-    autoIntimacyApiKey: (document.getElementById('autoIntimacyApiKey').value || '').trim(),
-    autoIntimacyModel: (document.getElementById('autoIntimacyModel').value || '').trim(),
   };
+  // （上下文保留档位已移到「全局设置 → 记忆与其它」，这里不再处理）
   try {
     const r = await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     const o = await r.json();
@@ -4770,16 +5487,24 @@ async function saveMemLimit() {
     c.memoryInjectLimit = v;
     const r = await fetch('/api/config', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(c) });
     const o = await r.json();
-    if (m) { m.className = 'msg ' + (o.ok ? 'ok' : 'bad'); m.textContent = o.ok ? '已保存，重启生效' : (o.msg || '失败'); }
+    if (m) { m.className = 'msg ' + (o.ok ? 'ok' : 'bad'); m.textContent = o.ok ? '已保存（已生效）' : (o.msg || '失败'); }
   } catch (e) { if (m) { m.className='msg bad'; m.textContent='请求失败：' + e.message; } }
 }
 
+let NPCS_ALL = [];
 async function loadNpcs() {
   const r = await fetch('/api/npcs');
-  const list = await r.json();
+  NPCS_ALL = await r.json();
+  npcLoaded = true;
+  filterNpcs();
+}
+function filterNpcs() {
   const box = document.getElementById('npcList');
+  if (!box) return;
+  const q = ((document.getElementById('npcSearch') || {}).value || '').trim().toLowerCase();
+  const list = q ? NPCS_ALL.filter(n => ((n.name || '').toLowerCase().indexOf(q) >= 0) || String(n.id || '').indexOf(q) >= 0) : NPCS_ALL;
   box.innerHTML = '';
-  if (!list.length) { box.innerHTML = '<div class=""hint"">还没有任何角色记忆</div>'; return; }
+  if (!list.length) { box.innerHTML = '<div class=""hint"">' + (NPCS_ALL.length ? '没有匹配的角色' : '还没有任何角色记忆') + '</div>'; return; }
   for (const n of list) {
     const d = document.createElement('div');
     d.className = 'item';
@@ -4791,7 +5516,6 @@ async function loadNpcs() {
     };
     box.appendChild(d);
   }
-  npcLoaded = true;
 }
 async function loadMemory(id) {
   CUR_NPC = id;
@@ -4800,6 +5524,7 @@ async function loadMemory(id) {
   document.getElementById('memHead').style.display = 'none';
   document.getElementById('memBody').style.display = '';
   document.getElementById('memSkeleton').innerHTML = renderSkeleton(m);
+  countPast();
   document.getElementById('memFacts').innerHTML = renderFacts(m) || '（空）';
   document.getElementById('memChunks').innerHTML = renderChunks(m);
   loadScopes();
@@ -4814,9 +5539,45 @@ function renderSkeleton(m) {
       + '<button class=""x"" onclick=""delRel(this)"">×</button></div>';
   }
   h += '<button class=""add"" onclick=""addRel()"">+ 新增关系</button></div></div>';
+  const pastMax = m.pastSummaryMax || 300;
+  window.__pastMax = pastMax;
+  h += '<div style=""margin-top:10px""><b style=""color:var(--gold);font-size:13px"">过往总述（分代）</b>'
+    + '<div class=""hint"" style=""margin-top:4px"">按「代」累积：每次记忆合并（12~48 轮，跟上下文档位走）批量产出 1~4 代（每代 ≤30 字，只写事件不写描写），保留最近 '
+    + (m.pastGenMax || 10) + ' 代。这里显示的是<b>渲染后的总述</b>（实际注入提示词的内容）。</div>'
+    + '<textarea id=""sk-past"" style=""min-height:110px;margin-top:6px"" oninput=""countPast()"" placeholder=""（空）点下面「立即整理」先生成，再手动改"">' + esc(m.pastSummary || '') + '</textarea>'
+    + '<div class=""hint"" style=""margin-top:4px"">上限 ' + pastMax + ' 字。手动保存 = <b>重置为第 0 代</b>（清空分代）。</div>'
+    + '<div id=""sk-past-count"" style=""font-size:12px;margin-top:2px""></div>'
+    + '<div style=""margin-top:6px;display:flex;align-items:center;gap:8px;flex-wrap:wrap"">'
+    + '  <button class=""ghost"" onclick=""compressPastGen()"">压缩旧总述（第 0 代 → 30 字）</button>'
+    + '  <span class=""msg"" id=""sk-past-msg""></span>'
+    + '</div>'
+    + '</div>';
   h += '<div><b style=""color:var(--gold);font-size:13px"">处境</b>'
     + '<textarea id=""sk-situation"" style=""min-height:72px;margin-top:6px"">' + esc(m.situation || '') + '</textarea></div>';
   return h;
+}
+function countPast() {
+  const el = document.getElementById('sk-past');
+  const c = document.getElementById('sk-past-count');
+  if (!el || !c) return;
+  const n = (el.value || '').length;
+  const max = window.__pastMax || 300;
+  c.textContent = '当前 ' + n + ' / ' + max + ' 字';
+  c.style.color = n > max ? '#e05252' : '#8a8a8a';
+  if (n > max) c.textContent += '（超出上限，请删减后再保存）';
+}
+async function compressPastGen() {
+  if (!CUR_NPC) { alert('先在左边选一个角色'); return; }
+  const m = document.getElementById('sk-past-msg');
+  if (m) { m.className = 'msg warn'; m.textContent = '压缩中…（调一次模型，几秒）'; }
+  try {
+    const r = await fetch('/api/memory/compresspast?npc=' + encodeURIComponent(CUR_NPC), { method: 'POST' });
+    const o = await r.json();
+    if (m) { m.className = 'msg ' + (o.ok ? 'ok' : 'bad'); m.textContent = o.msg || (o.ok ? '完成' : '失败'); }
+    if (o.ok) { await loadMemory(CUR_NPC); }
+  } catch (e) {
+    if (m) { m.className = 'msg bad'; m.textContent = '请求失败：' + e.message; }
+  }
 }
 function addRel() {
   const box = document.getElementById('sk-rels');
@@ -4842,10 +5603,17 @@ async function saveSkeleton() {
     if (v) relations.push(v);
   });
   const situation = ((document.getElementById('sk-situation') || {}).value || '').trim();
+  const pastSummary = ((document.getElementById('sk-past') || {}).value || '').trim();
   const msg = document.getElementById('skelMsg');
+  // ★ 2026-11-02 主人定：超 300 字拦下不让存（前端先拦，后端再拦一次）
+  const pastMax = window.__pastMax || 300;
+  if (pastSummary.length > pastMax) {
+    if (msg) { msg.className = 'msg bad'; msg.textContent = '过往总述超 ' + pastMax + ' 字（当前 ' + pastSummary.length + ' 字），请删减后再保存'; }
+    return;
+  }
   try {
     const r = await fetch('/api/memory/skeleton?npc=' + encodeURIComponent(id), {
-      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ relations, situation }) });
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ relations, situation, pastSummary }) });
     const o = await r.json();
     if (msg) { msg.className = 'msg ' + (o.ok ? 'ok' : 'bad'); msg.textContent = o.msg || (o.ok ? '已保存' : '失败'); }
     if (o.ok) refreshMemoryPart('skeleton');
@@ -4857,12 +5625,26 @@ function renderChunks(m) {
   const summaries = chunks.filter(x => x.kind === 'Summary' || x.kind === 'summary');
   const dialogs = chunks.filter(x => x.kind !== 'Summary' && x.kind !== 'summary');
   let h = '';
-  h += '<b style=""color:var(--gold);font-size:13px"">摘要段（' + summaries.length + '）</b>';
-  h += '<div id=""sumBox"">';
+  // ★ 2026-11-03：摘要改成按段追加后会越积越多 → 按轮次(Turn)分组折叠，默认只展开最近 2 组
+  const byTurn = {};
   for (const x of summaries) {
-    h += '<div class=""tag"" data-sid=""' + x.id + '""><textarea style=""min-height:60px;flex:1"">' + esc(x.text || '') + '</textarea>'
-      + '<button class=""x"" onclick=""delSummary(' + x.id + ')"">×</button></div>';
+    const t = x.turn || 0;
+    (byTurn[t] = byTurn[t] || []).push(x);
   }
+  const turns = Object.keys(byTurn).map(Number).sort((a, b) => b - a);
+  h += '<b style=""color:var(--gold);font-size:13px"">摘要段（' + turns.length + ' 段 / ' + summaries.length + ' 句）</b>';
+  h += '<div id=""sumBox"">';
+  turns.forEach((t, idx) => {
+    const list = byTurn[t];
+    const open = idx < 2 ? ' open' : '';
+    h += '<details' + open + ' style=""margin:6px 0"">'
+      + '<summary style=""cursor:pointer;color:#8a8a8a;font-size:12px"">第 ' + t + ' 轮段 · ' + list.length + ' 句</summary>';
+    for (const x of list) {
+      h += '<div class=""tag"" data-sid=""' + x.id + '""><textarea style=""min-height:60px;flex:1"">' + esc(x.text || '') + '</textarea>'
+        + '<button class=""x"" onclick=""delSummary(' + x.id + ')"">×</button></div>';
+    }
+    h += '</details>';
+  });
   h += '</div>';
   h += '<div style=""margin:8px 0""><button class=""ghost"" onclick=""saveSummaries()"">保存摘要</button><span class=""msg"" id=""sumMsg""></span></div>';
   if (dialogs.length) {
@@ -4914,7 +5696,7 @@ async function refreshMemoryPart(part) {
   try {
     const r = await fetch('/api/memory?npc=' + encodeURIComponent(id));
     const m = await r.json();
-    if (part === 'skeleton') document.getElementById('memSkeleton').innerHTML = renderSkeleton(m);
+    if (part === 'skeleton') { document.getElementById('memSkeleton').innerHTML = renderSkeleton(m); countPast(); }
     if (part === 'facts') document.getElementById('memFacts').innerHTML = renderFacts(m);
     if (part === 'chunks') document.getElementById('memChunks').innerHTML = renderChunks(m);
   } catch (e) {}
@@ -4979,7 +5761,7 @@ async function doTool(kind) {
   const id = CUR_NPC;
   const m = document.getElementById('toolMsg');
   if (!id) { m.className = 'msg bad'; m.textContent = '先选一个角色'; return; }
-  m.className = 'msg warn'; m.textContent = (kind === 'reclassify' ? '重评中' : (kind === 'compress' ? '压缩中' : '整理中')) + '…（可能要十几秒）';
+  m.className = 'msg warn'; m.textContent = (kind === 'reclassify' ? '重评中' : (kind === 'compress' ? '压缩中' : (kind === 'rewritefacts' ? '重写事实中' : '整理中'))) + '…（可能要十几秒）';
   try {
     const r = await fetch('/api/memory/' + kind + '?npc=' + encodeURIComponent(id), { method:'POST' });
     const o = await r.json();
@@ -4995,7 +5777,18 @@ async function doTool(kind) {
 async function loadScopes() {
   const id = CUR_NPC;
   const sel = document.getElementById('scopeSelect');
-  if (!id || !sel) return;
+  if (!sel) return;
+  // ★ 2026-11-08：没选角色时明确提示，别显示成「其他存档里没有记忆」（会被误认为功能坏了）
+  if (!id) {
+    sel.innerHTML = '';
+    const o0 = document.createElement('option');
+    o0.value = '';
+    o0.textContent = '（请先在左侧选择一个角色）';
+    sel.appendChild(o0);
+    sel.disabled = true;
+    return;
+  }
+  sel.disabled = false;
   try {
     const r = await fetch('/api/memory/scopes?npc=' + encodeURIComponent(id));
     const o = await r.json();
@@ -5318,7 +6111,13 @@ function collectEntries(cid) {
     const p = parseInt((box.querySelector('input[data-role=""priority""]') || {}).value || '5');
     const aw = box.querySelector('input[data-role=""always""]');
     const ent = { keys, text, priority: isNaN(p) ? 5 : p, 来源: box.dataset.src || 'manual' };
-    if (aw) { ent.始终注入 = !!aw.checked; ent.启用 = true; ent.类型 = '角色自身'; }
+    if (aw) {
+      ent.始终注入 = !!aw.checked; ent.启用 = true; ent.类型 = '角色自身';
+      // ★ 2026-11-07 修 BUG：玩家在控制台保存过的「角色自身」归玩家所有。
+      //   原来保留 auto → 重进游戏聊一句，WriteLorebookIfAbsent 重建时按「只保留 manual」把它丢掉，
+      //   于是自己写的背景/年龄被清空（表现就是「聊一句就失踪」）。
+      ent.来源 = 'manual';
+    }
     if (text.trim() || keys.length) entries.push(ent);
   });
   return { entries };
@@ -5545,6 +6344,19 @@ async function saveLore() {
     m.textContent = o.msg || '';
     if (o.ok) loadLore();
   } catch (e) { m.className = 'msg bad'; m.textContent = '请求失败：' + e.message; }
+}
+async function genFromSource() {
+  const id = document.getElementById('cardNpcSelect').value;
+  const m = document.getElementById('cardMsg');
+  if (!id) { if (m) { m.className = 'msg bad'; m.textContent = '先选一个角色'; } return; }
+  if (!confirm('根据游戏原文，调 AI 写一张完整的角色卡？\n\n⚠️ 会覆盖当前角色卡的内容（旧卡自动备份成 .重写备份_时间戳）\n   反过来，这个按钮也可以当成「按游戏人设重置角色卡」来用\n\n· 读「角色资料」（游戏原文抓下来的那段）\n· 生成后【直接保存】\n· 一次十几秒，别关控制台\n\n提示：正常情况第一次聊天就会自动生成卡，不需要点这个。')) return;
+  if (m) { m.className = 'msg warn'; m.textContent = '写卡中…（十几秒）'; }
+  try {
+    const r = await fetch('/api/card/genfromsource?npc=' + encodeURIComponent(id), { method:'POST' });
+    const o = await r.json();
+    if (m) { m.className = 'msg ' + (o.ok ? 'ok' : 'bad'); m.textContent = o.msg || (o.ok ? '已生成' : '失败'); }
+    if (o.ok) { setTimeout(function(){ if (typeof loadCard === 'function') loadCard(); }, 400); }
+  } catch (e) { if (m) { m.className = 'msg bad'; m.textContent = '请求失败：' + e.message; } }
 }
 async function cleanOldNames() {
   const m = document.getElementById('cardMsg');
